@@ -1,0 +1,50 @@
+# ============================================================
+# VascGuide AI Agent —— 项目配置（uv 结构）
+# 依赖真源：本文件；精确锁定（含传递依赖）：uv.lock
+# 常用命令：uv sync（建 .venv + 装依赖） | uv lock（刷新锁） | uv run main.py
+# ============================================================
+
+[project]
+name = "vascguide-ai-agent"
+version = "0.0.1"
+description = "面向主动脉瘤的临床决策支持智能体（术前—术中—术后三 Agent 闭环）"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"          # 与已锁定的兼容区间一致（下限由 numpy 决定）
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    # ---- 编排 / Agent 框架（LangChain 1.x 世代，须整体同代）----
+    "langgraph==1.2.14",                 # 编排框架：状态机 / Checkpoint / HITL
+    "langchain==1.4.4",                  # Agent 框架（1.x）
+    "langchain-core==1.6.9",             # 生态基座（兼容性锚点，勿跨大版本）
+    "langchain-openai==1.7.0",           # OpenAI / DeepSeek 兼容接入
+
+    # ---- 状态持久化（Checkpoint，架构要求全程可审计）----
+    "langgraph-checkpoint-sqlite==3.1.1",  # Checkpoint 落 SQLite
+
+    # ---- 配置 / 密钥读取 ----
+    "python-dotenv==1.2.4",              # 读 .env
+
+    # ---- 数据模型 / 校验 ----
+    "pydantic==2.14.0",                  # VascCase / ToolManifest / FinalRecommendation 等
+
+    # ---- 数值计算 / 机器学习 ----
+    "numpy==2.5.3",                      # 数值计算（影像指纹向量、几何计算）
+    "scikit-learn==1.9.1",               # 风险计算器（logistic 回归）等
+]
+
+[dependency-groups]
+# PEP 735：开发依赖（不进入运行时）
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.uv]
+# 本项目是「应用」而非可发布包，无需 build backend
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"

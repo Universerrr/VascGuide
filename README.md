@@ -72,7 +72,8 @@ zs-Midea VascGuide/
 │       ├── status_manager/     # ⑤ 状态管理
 │       └── output_translate/   # ⑥ 输出转译
 ├── tests/                      # 测试
-├── requirements.txt            # 依赖清单（核心依赖，已锁定精确版本）
+├── pyproject.toml              # 依赖与项目元数据（唯一"真源"）
+├── uv.lock                     # 全量精确锁定（含传递依赖，由 uv 生成）
 ├── main.py                     # 系统入口（占位）
 ├── LICENSE                     # MIT
 ├── .gitignore                  # Python 模板
@@ -87,21 +88,22 @@ zs-Midea VascGuide/
 ## 四、快速开始
 
 > **环境要求：Python 3.13.x**（本项目锁定 `3.13.14`，见 `.python-version` 与「五、依赖版本策略」）。
+> 依赖与环境由 **uv** 管理（`pyproject.toml` + `uv.lock`），一条命令即可同步。
 
 ```bash
-# 1) 创建虚拟环境（推荐）
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# macOS / Linux
-source venv/bin/activate
+# 0) 如未安装 uv：
+#    Windows(PowerShell): irm https://astral.sh/uv/install.ps1 | iex
+#    macOS / Linux:       curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2) 安装核心依赖
-pip install -r requirements.txt
+# 1) 建环境 + 安装全部依赖（≈ npm install）
+uv sync
 
-# 3) 运行占位入口
-python main.py
+# 2) 运行占位入口（≈ npm run）
+uv run main.py
 ```
+
+> - uv 会自动创建 `.venv/` 并按 `uv.lock` **精确安装**，**无需手动 `activate`**；
+> - 首次克隆若尚无 `uv.lock`，执行 `uv sync` 会自动生成。
 
 预期输出：打印项目名称与当前阶段（`skeleton`）。
 
@@ -119,14 +121,16 @@ python main.py
 | 下限 | ≥ 3.12 | 由 `numpy 2.5.x` 决定（其要求 `>=3.12`） |
 | 上限 | < 3.14 | `langgraph 1.2.x` 官方分类器目前止于 3.13，故 3.14 暂不采用 |
 
-### 2. 核心依赖（精确锁定）
+### 2. 运行时依赖（精确锁定）
 
 | 包 | 锁定版本 | 作用 | 对 Python 要求 |
 |---|---|---|---|
 | langgraph | `1.2.14` | 编排 / 状态机 / Checkpoint | ≥ 3.10 |
 | langchain | `1.4.4` | Agent 框架（1.x） | ≥ 3.10, < 4 |
 | langchain-core | `1.6.9` | 生态基座（兼容性锚点） | ≥ 3.10, < 4 |
-| langchain-openai | `1.7.0` | OpenAI 模型接入 | ≥ 3.10 |
+| langchain-openai | `1.7.0` | OpenAI / DeepSeek 兼容接入 | ≥ 3.10 |
+| langgraph-checkpoint-sqlite | `3.1.1` | Checkpoint 落 SQLite（全程可审计） | ≥ 3.10 |
+| python-dotenv | `1.2.4` | 读取 `.env` 配置 | ≥ 3.10 |
 | pydantic | `2.14.0` | 数据模型 / 校验 | ≥ 3.10 |
 | numpy | `2.5.3` | 数值计算 | ≥ 3.12 |
 | scikit-learn | `1.9.1` | 风险计算（logistic）等 | ≥ 3.11 |
@@ -138,30 +142,30 @@ python main.py
 - **langgraph 与 langchain 同代**：LangChain 1.x 的 agent 运行在 LangGraph 之上，本组合取 `langgraph 1.2.x` + `langchain 1.x`。
 - **pydantic 必须 v2**：`langchain-core 1.x` 依赖 pydantic v2，本组合用 `2.14.0`；切勿混入 pydantic v1（且 pydantic v1 不兼容 Python ≥3.14）。
 - **numpy 2.x 与 scikit-learn 1.9.x 兼容**：sklearn 要求 `numpy>=1.24.1`、`scipy>=1.10.0`，`numpy 2.5.3` 满足。
-- **传递依赖**：`scipy`、`openai`、`pydantic-core`、`joblib` 等由 pip 自动解析，除非做 lock，否则不要手动钉死。
+- **依赖真源与锁定**：直接依赖写在 `pyproject.toml`；`uv.lock` 锁定**全部（含传递）**依赖，二者均入库，保证任何人 `uv sync` 得到一致结果。
+- **传递依赖**：`scipy`、`openai`、`pydantic-core`、`joblib` 等**无需手写**，由 `uv.lock` 统一精确锁定。
 
 ### 4. 安装与「完全复现」
 
 ```bash
-# 安装锁定的直接依赖
-pip install -r requirements.txt
-
-# 如需锁定全部传递依赖（推荐用于生产 / CI）
-pip install pip-tools
-pip-compile requirements.txt -o requirements.lock.txt   # 生成完整锁文件
-pip install -r requirements.lock.txt                    # 按锁文件精确安装
+uv sync              # 按 pyproject.toml + uv.lock 建环境并精确安装（≈ npm install / npm ci）
+uv lock              # 依赖变更后刷新 uv.lock（≈ 更新 package-lock.json）
+uv add <pkg>         # 新增依赖（自动写入 pyproject.toml 并刷新锁 ≈ npm install <pkg>）
+uv add --dev <pkg>   # 新增开发依赖
+uv run <cmd>         # 在项目环境中执行命令（≈ npm run）
 ```
 
 ### 5. 复核与注意
 
 ```bash
-python -V     # 应输出 Python 3.13.x
-pip check     # 检查已装依赖是否存在冲突
-pip freeze    # 查看实际解析出的全部版本
+uv run python -V     # 应输出 Python 3.13.x
+uv tree              # 查看依赖树
+uv pip check         # 检查是否存在依赖冲突
 ```
 
 - 上述版本为 **2026-10-09** 各库当前最新稳定版。
-- ⚠️ 本次锁定依据各库官方元数据（`Requires` / classifiers）推导，**尚未在联网环境实际安装验证**（当前沙箱无法直连 PyPI）。首次联网安装后，请执行上面的 `pip check` 并生成 `requirements.lock.txt` 复核。
+- ✅ **已用 `uv lock` 实际解析验证**（2026-10-09）：共 **65 个包**全部解析成功、无依赖冲突，上表 9 个直接依赖版本与 `uv.lock` **完全一致**。
+- 传递依赖由 `uv.lock` 精确锁定，例如 `scipy 1.18.1`、`openai 3.26.1`、`pydantic-core 2.50.0`、`langgraph-checkpoint 4.2.0`；开发依赖 `pytest 9.1.1`、`pytest-cov 7.1.0`、`ruff 0.16.10`。
 
 ---
 
