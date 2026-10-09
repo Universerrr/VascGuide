@@ -1,0 +1,66 @@
+# ============================================================
+# VascGuide AI Agent — .gitignore
+# Python 模板
+# ============================================================
+
+# ---- Python bytecode / caches ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ---- Build / packaging ----
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+
+# ---- Virtual environments ----
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# ---- Environment variables & secrets ----
+.env
+.env.*
+*.env
+secrets.*
+!.env.example
+
+# ---- Testing / linting / type-check caches ----
+.pytest_cache/
+.pytest-tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+pytest-cache-files-*/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Local agent workspace (记忆/会话态) ----
+.workbuddy/
+
+# ---- Local data / artifacts (按需保留目录结构) ----
+*.log
+.DS_Store

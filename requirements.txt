@@ -1,0 +1,15 @@
+# 依赖清单 —— VascGuide AI Agent
+# 说明：仅列出核心依赖，不锁定版本；请在各自虚拟环境中按需固定版本。
+# 参见 README.md 与 docs/ 了解系统架构。
+
+# ---- 编排 / Agent 框架 ----
+langgraph
+langchain
+langchain-openai
+
+# ---- 数据模型 / 校验 ----
+pydantic
+
+# ---- 数值计算 / 机器学习 ----
+numpy
+scikit-learn
