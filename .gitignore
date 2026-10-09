@@ -23,7 +23,7 @@ venv/
 .venv/
 env/
 ENV/
-.python-version
+# 注意：.python-version 用于锁定并共享解释器版本（3.13.14），故不忽略、需入库。
 
 # ---- Environment variables & secrets ----
 .env

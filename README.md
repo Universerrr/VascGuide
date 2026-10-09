@@ -72,10 +72,11 @@ zs-Midea VascGuide/
 │       ├── status_manager/     # ⑤ 状态管理
 │       └── output_translate/   # ⑥ 输出转译
 ├── tests/                      # 测试
-├── requirements.txt            # 依赖清单（核心依赖，不锁定版本）
+├── requirements.txt            # 依赖清单（核心依赖，已锁定精确版本）
 ├── main.py                     # 系统入口（占位）
 ├── LICENSE                     # MIT
 ├── .gitignore                  # Python 模板
+├── .python-version             # 解释器版本锁定（3.13.14）
 └── README.md
 ```
 
@@ -84,6 +85,8 @@ zs-Midea VascGuide/
 ---
 
 ## 四、快速开始
+
+> **环境要求：Python 3.13.x**（本项目锁定 `3.13.14`，见 `.python-version` 与「五、依赖版本策略」）。
 
 ```bash
 # 1) 创建虚拟环境（推荐）
@@ -104,7 +107,65 @@ python main.py
 
 ---
 
-## 五、开发约定（规划）
+## 五、依赖版本策略（已锁定）
+
+> 锁定日期：**2026-10-09**。锁定后如无必要请勿升级，避免版本漂移导致安装/运行不一致。
+
+### 1. 解释器版本
+
+| 项目 | 版本 | 说明 |
+|---|---|---|
+| 目标 | **Python 3.13.x** | 锁定 `3.13.14`（实测通过），见 `.python-version` |
+| 下限 | ≥ 3.12 | 由 `numpy 2.5.x` 决定（其要求 `>=3.12`） |
+| 上限 | < 3.14 | `langgraph 1.2.x` 官方分类器目前止于 3.13，故 3.14 暂不采用 |
+
+### 2. 核心依赖（精确锁定）
+
+| 包 | 锁定版本 | 作用 | 对 Python 要求 |
+|---|---|---|---|
+| langgraph | `1.2.14` | 编排 / 状态机 / Checkpoint | ≥ 3.10 |
+| langchain | `1.4.4` | Agent 框架（1.x） | ≥ 3.10, < 4 |
+| langchain-core | `1.6.9` | 生态基座（兼容性锚点） | ≥ 3.10, < 4 |
+| langchain-openai | `1.7.0` | OpenAI 模型接入 | ≥ 3.10 |
+| pydantic | `2.14.0` | 数据模型 / 校验 | ≥ 3.10 |
+| numpy | `2.5.3` | 数值计算 | ≥ 3.12 |
+| scikit-learn | `1.9.1` | 风险计算（logistic）等 | ≥ 3.11 |
+
+### 3. 兼容性要点（必须同时满足）
+
+- **Python 下限由 numpy 决定**：`numpy 2.5.3` 要求 `>=3.12`，`scikit-learn 1.9.1` 要求 `>=3.11`，其余库仅要求 `>=3.10`。取交集 → **Python 3.12 ~ 3.13**，本项目锁定 **3.13.14**。
+- **LangChain 家族必须「同代」**：`langchain` / `langchain-core` / `langchain-openai` 互为依赖，必须同时处于 **1.x** 世代。一旦混入旧版 `langchain-core`（0.x），安装即报依赖冲突 —— 这是最常见的坑。
+- **langgraph 与 langchain 同代**：LangChain 1.x 的 agent 运行在 LangGraph 之上，本组合取 `langgraph 1.2.x` + `langchain 1.x`。
+- **pydantic 必须 v2**：`langchain-core 1.x` 依赖 pydantic v2，本组合用 `2.14.0`；切勿混入 pydantic v1（且 pydantic v1 不兼容 Python ≥3.14）。
+- **numpy 2.x 与 scikit-learn 1.9.x 兼容**：sklearn 要求 `numpy>=1.24.1`、`scipy>=1.10.0`，`numpy 2.5.3` 满足。
+- **传递依赖**：`scipy`、`openai`、`pydantic-core`、`joblib` 等由 pip 自动解析，除非做 lock，否则不要手动钉死。
+
+### 4. 安装与「完全复现」
+
+```bash
+# 安装锁定的直接依赖
+pip install -r requirements.txt
+
+# 如需锁定全部传递依赖（推荐用于生产 / CI）
+pip install pip-tools
+pip-compile requirements.txt -o requirements.lock.txt   # 生成完整锁文件
+pip install -r requirements.lock.txt                    # 按锁文件精确安装
+```
+
+### 5. 复核与注意
+
+```bash
+python -V     # 应输出 Python 3.13.x
+pip check     # 检查已装依赖是否存在冲突
+pip freeze    # 查看实际解析出的全部版本
+```
+
+- 上述版本为 **2026-10-09** 各库当前最新稳定版。
+- ⚠️ 本次锁定依据各库官方元数据（`Requires` / classifiers）推导，**尚未在联网环境实际安装验证**（当前沙箱无法直连 PyPI）。首次联网安装后，请执行上面的 `pip check` 并生成 `requirements.lock.txt` 复核。
+
+---
+
+## 六、开发约定（规划）
 
 - **规则优先**：凡属确定性判定（路由 / 评分 / 分层 / 规划 / 预警 / 仲裁）一律以确定性代码实现，不交由 LLM。
 - **LLM 边界**：LLM 仅承担输入抽取与输出转译，且不得改写数值与结论。
@@ -113,6 +174,6 @@ python main.py
 
 ---
 
-## 六、许可证
+## 七、许可证
 
 本项目基于 [MIT License](./LICENSE) 开源。
