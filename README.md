@@ -29,15 +29,29 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 
 ## 二、当前阶段
 
-> ⚠️ **本阶段仅完成项目骨架（skeleton），不包含任何业务逻辑。**
+> **确定性内核（数据模型 + 规则层）已落地并通过验证；编排层与 LLM 接入尚未开始。**
 
-- 三 Agent 的完整目录骨架已搭好，每个目录含占位 `__init__.py`；
-- `src/models/` 下的 `preop.py` / `intraop.py` / `postop.py` 为**占位文件**（仅 docstring 声明规划中的模型，无实现）；
-- `main.py` 为占位入口，仅打印项目名称与当前阶段；
-- 暂无任何函数实现、类定义或业务逻辑代码；
-- 尚未接入 LangGraph 编排、LLM 调用与确定性工具。
+### ✅ 已完成
 
-后续开发将按「确定性内核优先」的顺序逐步填充：先落地数据模型与确定性工具，再串接各层流水线。
+| 模块 | 内容 |
+|---|---|
+| **术前数据模型（5 个）** | `VascCase`（51 字段）、`VascMeasurement`、`AnatomyScore`、`RiskAssessment`、`FinalRecommendation` |
+| **共享枚举（19 个）** | `StrEnum` + 中文值，覆盖性别、病种、破裂状态、解剖分型、恶性肿瘤等 |
+| **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 置信度）、`UrgencyFlagAudit` |
+| **确定性规则层** | `router.py`（P0a~P8 路由流水线）+ `version.py`（规则版本注册表），详见「四」 |
+| **测试与工具链** | 108 项测试全绿（41 行为基线 + 67 数据契约）、`ruff` 无告警、覆盖率 97% |
+
+### ⏳ 尚未开始
+
+- **输入层 LLM 抽取器**（`preop_agent/input_layer/`）与**输出层转译**（`preop_agent/output_layer/`）——
+  这是全项目**仅有的两个**允许出现 LLM 的节点。
+- **`preop_agent/` 四层骨架** —— `router_layer/`（对规则层的薄封装）、`execution_layer/`（5 个确定性工具）。
+- **LangGraph `StateGraph` 编排 + SQLite Checkpoint 落盘** —— 实现全程可审计。
+- **术中 / 术后 Agent** —— `intraop_agent/`、`postop_agent/` 目前仅为目录骨架，无实现。
+- **`main.py`** —— 仍为占位入口。
+
+推进顺序遵循「**确定性内核优先**」：先落地数据模型与确定性工具，
+**LLM 只在最后接入两端的抽取与转译节点**，中间管道保持零 LLM 参与。
 
 ---
 
@@ -45,49 +59,141 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 
 ```
 zs-Midea VascGuide/
-├── docs/                       # 架构文档、临床指南（如 ESVS 2024）
+├── docs/                        # 架构文档、临床指南（如 ESVS 2024）
 ├── src/
-│   ├── core/                   # 核心引擎（LangGraph 编排、状态管理、Checkpoint）
-│   ├── models/                 # Pydantic 数据模型
-│   │   ├── preop.py            # VascCase, ToolManifest, VascMeasurement, FinalRecommendation
-│   │   ├── intraop.py          # IntraOpIntent（预留）
-│   │   └── postop.py           # PostOpCase, FollowUpPlan, FollowUpStatus（预留）
-│   ├── tools/                  # 确定性工具集（指南引擎、影像量化器、解剖评分器等）
-│   ├── utils/                  # 工具函数（LLM 调用封装、Checkpoint 管理）
-│   ├── preop_agent/            # 术前决策 Agent
-│   │   ├── input_layer/        # 输入层（LLM 抽取、急诊初筛）
-│   │   ├── router_layer/       # 路由层（四模式调度）
-│   │   ├── execution_layer/    # 执行层（5 个确定性工具）
-│   │   └── output_layer/       # 聚合输出层（聚合、仲裁、转译）
-│   ├── intraop_agent/          # 术中导航 Agent（预留）
-│   │   ├── localization/       # 术中定位
-│   │   ├── assessment/         # 术中评估
-│   │   ├── monitoring/         # 生命体征监测
-│   │   └── decision_tree/      # 确定性决策树
-│   └── postop_agent/           # 术后随访 Agent（预留）
-│       ├── case_update/        # ① 病例更新
-│       ├── risk_stratify/      # ② 风险分层
-│       ├── followup_plan/      # ③ 随访规划
-│       ├── anomaly_monitor/    # ④ 异常监控
-│       ├── status_manager/     # ⑤ 状态管理
-│       └── output_translate/   # ⑥ 输出转译
-├── tests/                      # 测试
-├── pyproject.toml              # 依赖与项目元数据（唯一"真源"）
-├── uv.lock                     # 全量精确锁定（含传递依赖，由 uv 生成）
-├── main.py                     # 系统入口（占位）
-├── LICENSE                     # MIT
-├── .gitignore                  # Python 模板
-├── .python-version             # 解释器版本锁定（3.13.14）
-└── README.md
+│   ├── core/                    # 核心引擎（LangGraph 编排、状态管理、Checkpoint）〔骨架〕
+│   ├── models/                  # Pydantic 数据模型
+│   │   ├── __init__.py          # ✅ 统一导出（模型 + 枚举 + 审计结构）
+│   │   ├── enums.py             # ✅ 19 个共享枚举（StrEnum，中文值）
+│   │   ├── audit.py             # ✅ 审计留痕结构（FieldProvenance / UrgencyFlagAudit）
+│   │   ├── preop/               # ✅ 术前模型包（含 __init__.py 聚合导出）
+│   │   │   ├── case.py          # ✅ VascCase（51 字段）+ derive()
+│   │   │   ├── measurement.py   # ✅ VascMeasurement + CenterlinePoint
+│   │   │   ├── assessment.py    # ✅ AnatomyScore + RiskAssessment
+│   │   │   └── recommendation.py# ✅ FinalRecommendation + EvidenceItem + DecisionStep
+│   │   ├── intraop.py           # IntraOpIntent（预留，空占位）
+│   │   └── postop.py            # PostOpCase / FollowUpPlan / FollowUpStatus（预留，空占位）
+│   ├── rules/                   # ✅ 确定性规则层（详见「四」；无 __init__.py）
+│   │   ├── router.py            # ✅ P0a~P8 路由判定流水线（纯函数）
+│   │   └── version.py           # ✅ 规则版本号注册表（审计必需）
+│   ├── tools/                   # 确定性工具集（指南引擎、影像量化器、解剖评分器等）〔骨架〕
+│   ├── utils/                   # 工具函数（LLM 调用封装、Checkpoint 管理）〔骨架〕
+│   ├── preop_agent/             # 术前决策 Agent〔骨架，四层均为空目录〕
+│   │   ├── input_layer/         # 输入层（LLM 抽取、急诊初筛）← 唯一 LLM 入口之一
+│   │   ├── router_layer/        # 路由层（对 src/rules/ 的薄封装，临床规则 0 行）
+│   │   ├── execution_layer/     # 执行层（5 个确定性工具）
+│   │   └── output_layer/        # 聚合输出层（聚合、仲裁、转译）← 唯一 LLM 入口之一
+│   ├── intraop_agent/           # 术中导航 Agent〔骨架〕
+│   │   ├── localization/        # 术中定位
+│   │   ├── assessment/          # 术中评估
+│   │   ├── monitoring/          # 生命体征监测
+│   │   └── decision_tree/       # 确定性决策树
+│   └── postop_agent/            # 术后随访 Agent〔骨架〕
+│       ├── case_update/         # ① 病例更新
+│       ├── risk_stratify/       # ② 风险分层
+│       ├── followup_plan/       # ③ 随访规划
+│       ├── anomaly_monitor/     # ④ 异常监控
+│       ├── status_manager/      # ⑤ 状态管理
+│       └── output_translate/    # ⑥ 输出转译
+├── tests/                       # 测试（无 __init__.py，见「七、开发约定」）
+│   ├── test_preop.py            # ✅ 41 项路由行为基线
+│   └── test_model_contract.py   # ✅ 67 项数据契约
+├── pyproject.toml               # 依赖与项目元数据（唯一"真源"）
+├── uv.lock                      # 全量精确锁定（含传递依赖，由 uv 生成）
+├── main.py                      # 系统入口（占位）
+├── LICENSE                      # MIT
+├── .gitignore                   # Python 模板
+├── .python-version              # 解释器版本锁定（3.13.14）
+└── README.md                    # 本文档 —— 全项目唯一说明入口
 ```
 
-> 说明：本仓库根目录即为项目根目录。上述每个目录均包含一个占位的 `__init__.py`。
+**图例**：✅ = 已实现并通过测试；〔骨架〕= 只有目录结构，无业务逻辑；其余为预留文件。
+
+> **说明**
+> - 本仓库根目录即为项目根目录，**必须从仓库根运行**（`pyproject.toml` 中 `[tool.uv] package = false`，不是可安装包）。
+> - **目录职责说明统一由本文档承载**，不再在子目录下另建 `README.md`（单一真源，避免多处维护漂移）。
+> - **`__init__.py` 不是必需品**（PEP 420 命名空间包无它也能导入）。当前实际分布：
+>   `src/models/` 与 `src/models/preop/` 保留（承载聚合 re-export）；
+>   `src/rules/` 已移除（无 re-export 消费者）；`tests/` 已移除（非运行时包）。
+>   是否省略的判据见「七、开发约定」。
 
 ---
 
-## 四、快速开始
+## 四、核心模块：规则层（`src/rules/`）
 
-> **环境要求：Python 3.13.x**（本项目锁定 `3.13.14`，见 `.python-version` 与「五、依赖版本策略」）。
+> **治理红线：本层是判定层，禁止 `import` 任何 LLM 客户端。**
+> LLM 仅允许出现在 `preop_agent/input_layer/`（输入抽取）与 `preop_agent/output_layer/`（输出转译）两处。
+> 路由、解剖评分、风险分层、随访规划、异常检测、决策树仲裁 **全部为确定性代码**。
+
+本目录承载 VascGuide 的**全部确定性规则**，是「规则主导，LLM 为辅」这条红线的物理落点。
+它是一段**纯粹的确定性函数库**（性质等同 `import math`），**不是**交给 LLM 自主选择调用的工具（tool）。
+
+### 1. 文件
+
+| 文件 | 职责 |
+|---|---|
+| `router.py` | P0a~P8 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） |
+| `version.py` | 规则版本号注册表（复合版本串，审计必需） |
+
+### 2. 路由做什么（以及不做什么）
+
+`route(VascCase) → RouteResult`。它只回答**一个问题**：「这个病例该走哪条路？」
+
+```
+事实层输入  ──▶  P0a~P8 判定链（命中即短路）  ──▶  三选一结论 + 判定轨迹 + 规则版本
+                 急诊 > 复杂 > 指南
+```
+
+- **短路即优先级**：判定链自上而下，一旦命中立即返回，后续步骤不再求值。
+  「急诊 > 复杂 > 指南」不是配置项，而是**代码的物理结构**。
+- **两个兜底方向都是保守的**：全部不命中 → 回落为**复杂模式 + 需人工复核**（不默认「稳定」）；
+  指南模式下若仍有字段缺失 → 同样降级。关键字段缺失时置信度 `0.90 → 0.45`（×0.5）。
+- **每一步都留痕**：逐条写入 `StepTrace`（步骤号 / 判定条件 / 结果 / 规则编号 / 说明），
+  **含被否决的步骤**，最终结论附带 `RULESET_VERSION`。这是「历史结论可追溯复现」的落地方式。
+
+### 3. 设计原则
+
+1. **纯函数、无全局状态、无 IO** —— 相同输入必然得到相同输出（可复现）。
+2. **输出结构化中间结果**（含逐条判定轨迹），供审计落盘。
+3. **阈值 / 编号一律与 `.workbuddy/spec/VascCase字段设计表.xlsx` 对齐。**
+
+### 4. 变更纪律（审计红线）
+
+> 改动任何**阈值 / 病种归属 / 覆盖规则**后，**必须**在 `src/rules/version.py` 手动 bump 对应版本号，
+> 并在 `RULESET_CHANGELOG` 记录原因。否则历史结论无法追溯复现。
+
+当前版本串：**`table1@v1.0+table2@v1.4`**。
+
+由于本层是一个**独立、可被工具扫描的目录**，这条纪律可以自动化检查，例如：
+
+```
+改动了 src/rules/** 但未改动 src/rules/version.py  →  构建失败
+```
+
+### 5. 与 `preop_agent/router_layer/` 的关系
+
+`preop_agent/router_layer/` 必须是本目录的**薄封装** —— 只负责「图编排的胶水」
+（State ↔ `VascCase` 翻译、调用 `route()`、写 Checkpoint），**严禁重复实现任何规则逻辑**。
+
+| | `src/rules/`（本目录） | `preop_agent/router_layer/` |
+|---|---|---|
+| 关注 | 临床判定逻辑 | 图编排的胶水 |
+| 输入 / 输出 | `VascCase` → `RouteResult` | LangGraph `State` → State + Checkpoint |
+| 依赖 | 仅 `models`（零 IO / 零 LLM） | LangGraph、Checkpoint、日志 |
+| 临床规则行数 | 本目录 | **0 行** |
+
+`route()` 存在**两个调用者**：`VascCase.derive()`（服务无编排场景，如 CLI / 单测）与
+`router_layer` 节点（服务 LangGraph 编排）。**两处都必须是薄封装。**
+
+> **为什么规则不直接写在 `router_layer/` 里？** 因为三期 Agent 共享同一套临床口径，
+> 且规则必须能独立测试（现在 53 项路由测试不需要 LangGraph、不需要数据库、0.1 秒跑完）。
+> 绑定到 `preop_agent/` 下会导致跨层循环依赖、版本号漂移，并使「规则变更纪律」无法被机器检查。
+
+---
+
+## 五、快速开始
+
+> **环境要求：Python 3.13.x**（本项目锁定 `3.13.14`，见 `.python-version` 与「六、依赖版本策略」）。
 > 依赖与环境由 **uv** 管理（`pyproject.toml` + `uv.lock`），一条命令即可同步。
 
 ```bash
@@ -107,9 +213,39 @@ uv run main.py
 
 预期输出：打印项目名称与当前阶段（`skeleton`）。
 
+### 常用命令（测试 / 检查）
+
+```bash
+# 跑全部测试（应为 108 passed）
+uv run pytest tests/ -q
+
+# 静态检查（应为 All checks passed）
+uv run ruff check src/ tests/
+
+# 格式检查（不改文件；加 --diff 可预览改动）
+uv run ruff format --check src/ tests/
+uv run ruff format src/ tests/          # 真正改写文件
+
+# 覆盖率（按需，比朴素跑慢约 7 倍，会在仓库根生成 .coverage）
+uv run pytest tests/ --cov --cov-report=term-missing
+```
+
+> 也可以用解释器直接调用（等价）：`.venv/Scripts/python.exe -m pytest tests/ -q`。
+> **`pytest` 必须能从仓库根导入 `src`**，因此 `pyproject.toml` 保留了
+> `[tool.pytest.ini_options] pythonpath = ["."]` —— 移除它会让裸命令 `pytest` 报
+> `ModuleNotFoundError: No module named 'src'`（详见「七、开发约定」）。
+
+### 查看测试结果
+
+- **逐条通过/失败**：`pytest tests/ -v`，或 `--junit-xml=report.xml` 导出后转 HTML；
+- **覆盖了哪些代码**：`--cov-report=html` 生成 `htmlcov/index.html`，红色行即未被测试执行到的分支。
+
+> ⚠️ **覆盖率 ≠ 测试结果**：前者衡量「代码有多少行被执行到」，后者衡量「每个用例过没过」。
+> 两者互补 —— 一个看「测全了没有」，一个看「测的对不对」。当前 108 项全绿、覆盖率 97%。
+
 ---
 
-## 五、依赖版本策略（已锁定）
+## 六、依赖版本策略（已锁定）
 
 > 锁定日期：**2026-10-09**。锁定后如无必要请勿升级，避免版本漂移导致安装/运行不一致。
 
@@ -169,15 +305,28 @@ uv pip check         # 检查是否存在依赖冲突
 
 ---
 
-## 六、开发约定（规划）
+## 七、开发约定
 
 - **规则优先**：凡属确定性判定（路由 / 评分 / 分层 / 规划 / 预警 / 仲裁）一律以确定性代码实现，不交由 LLM。
 - **LLM 边界**：LLM 仅承担输入抽取与输出转译，且不得改写数值与结论。
-- **可审计**：全链路使用 LangGraph Checkpoint 留存状态，所有建议附证据链。
-- **占位优先**：骨架阶段只建目录与占位文件，业务逻辑分阶段填充。
+- **判定层禁 LLM**：`src/rules/**` 及全部判定层函数**禁止 import 任何 LLM 客户端** —— 硬性约束（见「四」）。
+- **规则变更纪律**：改动任何阈值 / 病种归属 / 覆盖规则后，**必须** bump `src/rules/version.py` 的版本号
+  并在 `RULESET_CHANGELOG` 记录原因；否则历史结论无法追溯复现。
+- **可审计**：全链路使用 LangGraph Checkpoint 留存状态，所有建议附证据链，可追溯至原始字段出处。
+- **模型与规则分离**：`models/` 只管结构，`rules/` 只管判定；依赖方向单向 `models → rules`，
+  跨层引用用**延迟导入**破循环（见 `case.py::derive()` 内部导入）。
+- **`VascCase` 管输入不管产物**：工具产物各自独立成模型，**不回写 `VascCase`**。
+- **文档单一真源**：目录职责统一在本文档「三、目录结构」维护，**不在子目录下另建 `README.md`**，
+  避免多处维护导致漂移。
+- **增量填充**：按「确定性内核优先」顺序推进，每阶段须保证测试全绿 + `ruff` 无告警。
+- **`__init__.py` 非必需**：Python 3 命名空间包（PEP 420）无它也能导入。是否保留按实际需要判断 ——
+  需要 **re-export / 显式包边界** 时保留；纯标记用途可省略。
+  省略前须确认两点：①本包无 `from .pkg import X` 形式的 re-export 消费者（否则直接 ImportError）；
+  ②目录内还有其他文件（**git 不跟踪空目录**，否则目录会从版本库消失）。
+  若省略的是 pytest 直接运行的目录，须保留 `pyproject.toml` 的 `pythonpath = ["."]`。
 
 ---
 
-## 七、许可证
+## 八、许可证
 
 本项目基于 [MIT License](./LICENSE) 开源。

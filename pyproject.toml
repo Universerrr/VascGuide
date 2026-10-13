@@ -36,6 +36,7 @@ dependencies = [
 [dependency-groups]
 # PEP 735：开发依赖（不进入运行时）
 dev = [
+    "openpyxl>=3.1.5",
     "pytest",
     "pytest-cov",
     "ruff",
@@ -48,3 +49,31 @@ package = false
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+
+# ============================================================
+# pytest 配置
+# pythonpath = ["."] 是 tests/__init__.py 移除后的配套项：
+#   若无 tests/__init__.py，pytest 的 prepend 导入模式只会把 tests/ 注入
+#   sys.path，导致 `pytest`（裸命令）报 ModuleNotFoundError: No module named 'src'。
+#   显式声明 pythonpath 后，`pytest` 与 `python -m pytest` 两种跑法结果一致。
+# ============================================================
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+# ============================================================
+# 覆盖率（coverage.py / pytest-cov）
+# 用法：
+#   跑测试并出报告：
+#     .venv/Scripts/python.exe -m pytest tests/ --cov --cov-report=term-missing
+#   不重跑测试，直接读已有 .coverage：
+#     .venv/Scripts/python.exe -m coverage report -m
+#   生成带行级高亮的网页版（浏览器可读）：
+#     .venv/Scripts/python.exe -m coverage html     → htmlcov/index.html
+# 说明：.coverage 是二进制 SQLite 数据文件，不可直接阅读；htmlcov/ 与 .coverage 均已 gitignore。
+# ============================================================
+[tool.coverage.run]
+source = ["src"]          # 只统计 src/，不把 tests/ 与 .venv 混进分母
+
+[tool.coverage.report]
+skip_empty = true         # 跳过 0 语句的文件：22 个空 __init__.py 不再刷屏
+show_missing = true       # 逐文件列出未覆盖行号
