@@ -34,6 +34,7 @@ from .case import (
     ENUM_FACT_FIELDS,
     ONE_DECIMAL_FIELDS,
     VascCase,
+    apply_route_result,
     derive,
 )
 from .measurement import CenterlinePoint, VascMeasurement
@@ -52,5 +53,6 @@ __all__ = [
     "RiskAssessment",
     "VascCase",
     "VascMeasurement",
+    "apply_route_result",
     "derive",
 ]

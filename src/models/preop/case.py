@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -46,6 +47,11 @@ from ..enums import (
     YesNoUnknown,
     strip_enum_annotation,
 )
+
+if TYPE_CHECKING:
+    # 仅供类型标注使用：运行时改为**函数内延迟导入**，以打破
+    # models ← rules ← models 的循环引用（rules 也 TYPE_CHECKING 本模块）。
+    from ...rules.router import RouteResult
 
 # 关键字段集：其缺失将触发「复杂模式 + 置信度×0.5」（依据表2 O25）。
 # 注意：只包含**事实层**字段——判定层由代码派生，必然存在，不可能缺失。
@@ -479,6 +485,37 @@ class VascCase(BaseModel):
         return v
 
 
+def apply_route_result(case: VascCase, result: RouteResult) -> VascCase:
+    """把 ``RouteResult`` 回填到 ``case`` 的判定层与输出层字段（**就地**）。
+
+    ⚠️ 纯确定性、无副作用之外的写操作，禁止引入任何 LLM 客户端（审计红线）。
+    ⚠️ 本函数只做「搬运」：不重新判定、不读原文、不改阈值。
+
+    为什么独立成公开函数（而非藏在 ``derive()`` 里）：
+        编排层（``preop_agent/router_layer``）需要「**只跑一次** ``route()``，
+        然后同时回填 case 与产出 FinalRecommendation」。若回填逻辑只存在于
+        ``derive()``，编排层要么重复调用 ``route()``（一次判定两处执行，有漂移风险），
+        要么自己抄一份回填代码（出现两处真相）。抽出后两处共用同一实现。
+
+    返回：
+        同一个 ``case`` 对象（便于链式调用）。
+    """
+    # ---- 回填判定层 ----
+    case.urgency_triggered = result.urgency_triggered
+    case.is_special_lesion = result.is_special_lesion
+    case.complex_anatomy = result.complex_anatomy
+    case.severe_comorbidity = result.severe_comorbidity
+    case.guideline_eligible = result.guideline_eligible
+    case.missing_critical_fields = list(result.missing_critical_fields)
+
+    # ---- 回填输出层 ----
+    case.confidence = result.confidence
+    case.manual_review_required = result.manual_review_required
+    case.route_mode = result.route_mode
+
+    return case
+
+
 def derive(case: VascCase) -> VascCase:
     """确定性派生入口：执行 P0a~P8 流水线，回填判定层与输出层字段。
 
@@ -497,21 +534,7 @@ def derive(case: VascCase) -> VascCase:
     from ...rules.router import route
 
     result = route(case)
-
-    # ---- 回填判定层 ----
-    case.urgency_triggered = result.urgency_triggered
-    case.is_special_lesion = result.is_special_lesion
-    case.complex_anatomy = result.complex_anatomy
-    case.severe_comorbidity = result.severe_comorbidity
-    case.guideline_eligible = result.guideline_eligible
-    case.missing_critical_fields = list(result.missing_critical_fields)
-
-    # ---- 回填输出层 ----
-    case.confidence = result.confidence
-    case.manual_review_required = result.manual_review_required
-    case.route_mode = result.route_mode
-
-    return case
+    return apply_route_result(case, result)
 
 
 __all__ = [
@@ -520,5 +543,6 @@ __all__ = [
     "ENUM_FACT_FIELDS",
     "ONE_DECIMAL_FIELDS",
     "VascCase",
+    "apply_route_result",
     "derive",
 ]

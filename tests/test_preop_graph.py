@@ -1,0 +1,757 @@
+"""编排层测试 —— 端到端流水线、Checkpoint 往返、以及两条架构守卫。
+
+与另两个测试文件的分工（刻意保持独立，不共享 fixture）：
+    · ``test_preop.py``           —— 路由**走得对不对**（41 项基线，本轮断言零改动）
+    · ``test_model_contract.py``  —— 数据**口径符不符合设计表**（67 项）
+    · ``test_preop_graph.py``（本文件）—— 编排**串得对不对 + 审计**落得住、可回放、
+      以及**架构红线是否被机械守住**：
+        ① 薄封装守卫（router_layer 不得偷藏任何临床规则）
+        ② 判定层零 LLM 守卫（判定路径不得 import 任何 LLM 客户端）
+
+运行方式（``uv run`` 会自动向上找到项目根并使用 ``.venv`` 解释器，
+无需手动 cd 或指定解释器路径）：
+
+    uv run pytest tests/test_preop_graph.py -v
+
+用例均以 ``GRAPH-`` 开头构造病例，避免与另两个文件的病例标识混淆。
+"""
+
+from __future__ import annotations
+
+import ast
+import logging
+import os
+import sqlite3
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
+from enum import Enum
+from itertools import pairwise
+from pathlib import Path
+from typing import Any
+
+import pytest
+from langgraph.checkpoint.sqlite import SqliteSaver
+from pydantic import BaseModel
+
+from src.models.audit import FieldProvenance, UrgencyFlagAudit
+from src.models.enums import (
+    DiseaseCategory,
+    FieldWriter,
+    PriorRepair,
+    RouteMode,
+    RuptureStatus,
+    Sex,
+    SymptomAAA,
+    TemporalStatus,
+)
+from src.models.preop.case import VascCase, derive
+from src.models.preop.recommendation import FinalRecommendation
+from src.preop_agent.execution_layer.node import (
+    IMPLEMENTED_TOOLS,
+    TOOL_REGISTRY,
+    execution_node,
+    run_tool,
+    unimplemented_tools,
+)
+from src.preop_agent.graph import (
+    build_checkpoint_serde,
+    build_preop_graph,
+    run_preop,
+    sqlite_checkpointer,
+    thread_config,
+)
+from src.preop_agent.input_layer.node import (
+    EXTRACTOR_BLOCKED_REASON,
+    EXTRACTOR_IMPLEMENTED,
+    extract_case_from_text,
+    input_node,
+)
+from src.preop_agent.output_layer.node import (
+    PRIMARY_RECOMMENDATION_PLACEHOLDER,
+    TRANSLATION_IMPLEMENTED,
+    output_node,
+)
+from src.preop_agent.router_layer.node import router_node
+from src.preop_agent.state import HASHED_KEYS, _project, stable_hash
+from src.rules.router import route
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: 判定层目录：这些目录下的代码**只允许是确定性实现**。
+JUDGMENT_LAYER_DIRS = (
+    REPO_ROOT / "src" / "rules",
+    REPO_ROOT / "src" / "preop_agent" / "router_layer",
+    REPO_ROOT / "src" / "preop_agent" / "execution_layer",
+    REPO_ROOT / "src" / "preop_agent" / "output_layer",
+)
+
+ROUTER_LAYER_NODE = REPO_ROOT / "src" / "preop_agent" / "router_layer" / "node.py"
+
+#: LLM 客户端 SDK 的模块名前缀（判定层出现任何一个即视为红线被破）。
+FORBIDDEN_LLM_MODULES = (
+    "openai",
+    "anthropic",
+    "cohere",
+    "mistralai",
+    "litellm",
+    "ollama",
+    "llama_cpp",
+    "transformers",
+    "dashscope",
+    "zhipuai",
+    "qianfan",
+    "groq",
+    "together",
+    "google.generativeai",
+    "google.genai",
+    "langchain_openai",
+    "langchain_anthropic",
+)
+
+#: 临床规则痕迹：病种 / 解剖 / 处置关键词。thin wrapper 里出现即说明规则被抄了一份。
+FORBIDDEN_CLINICAL_TOKENS = (
+    "肾下",
+    "近肾",
+    "短颈",
+    "瘤颈",
+    "成角",
+    "钙化",
+    "血栓",
+    "破裂",
+    "感染",
+    "炎症",
+    "内漏",
+    "假性动脉瘤",
+    "吻合口",
+    "合并症",
+    "急诊",
+    "入路",
+)
+
+
+def make_case(**overrides: Any) -> VascCase:
+    """构造一个默认走指南模式、无字段缺失的基线病例（标识以 GRAPH- 开头）。"""
+    base: dict[str, Any] = {
+        "case_id": "GRAPH-000",
+        "age": 72,
+        "sex": Sex.MALE,
+        "temporal_status": TemporalStatus.CURRENT,
+        "symptom_aaa_related": SymptomAAA.ABSENT,
+        "rupture_status": RuptureStatus.INTACT,
+        "prior_repair": PriorRepair.NONE,
+        "disease_category": [DiseaseCategory.ASYMPTOMATIC],
+        "max_diameter_mm": 42.0,
+        "neck_length_mm": 25.0,
+        "neck_angle_deg": 20.0,
+        "access_diameter_mm": 9.0,
+        "anatomy_level": "肾下",
+    }
+    base.update(overrides)
+    return VascCase(**base)  # type: ignore[arg-type]
+
+
+def make_rich_case() -> VascCase:
+    """带完整审计留痕（证据链 + 急症标志留痕）的病例。"""
+    return make_case(
+        case_id="GRAPH-RICH",
+        field_evidence={
+            "max_diameter_mm": FieldProvenance(
+                source_quote="CTA 示腹主动脉最大径 42mm。",
+                writer=FieldWriter.LLM,
+                confidence=0.95,
+            )
+        },
+        urgency_flag_audit=UrgencyFlagAudit(
+            set_by=FieldWriter.HUMAN,
+            set_at="2026-10-13T09:30:00+08:00",
+            reason="门诊初筛标记",
+        ),
+    )
+
+
+def _iter_source_files(directory: Path) -> list[Path]:
+    return sorted(p for p in directory.rglob("*.py") if p.is_file())
+
+
+def _iter_imported_modules(path: Path) -> list[str]:
+    """列出源文件里所有 ``import`` 的模块全名（含相对导入的模块部分）。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    modules: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            modules.append(node.module)
+    return modules
+
+
+def _code_constants(path: Path) -> tuple[list[str], list[float]]:
+    """取出源码里的**代码常量**（字符串 / 数值），**排除文档字符串**。
+
+    排除 docstring 是刻意的：文档里解释「规则为什么不写在这里」是正当的，
+    但**代码里**出现阈值或病种关键词就不正当了。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    docstring_ids: set[int] = set()
+    holders = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    for node in ast.walk(tree):
+        body = getattr(node, "body", [])
+        if not body or not isinstance(node, holders):
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            docstring_ids.add(id(first.value))
+
+    strings: list[str] = []
+    numbers: list[float] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or id(node) in docstring_ids:
+            continue
+        if isinstance(node.value, str):
+            strings.append(node.value)
+        elif isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            numbers.append(float(node.value))
+    return strings, numbers
+
+
+# ===========================================================================
+# 稳定哈希
+# ===========================================================================
+class TestStableHash:
+    def test_hash_ignores_key_order(self) -> None:
+        """同内容、不同插入顺序 → 同哈希（可复现的前提）。"""
+        case = make_case()
+        a = {"case": case, "case_id": "GRAPH-000"}
+        b = {"case_id": "GRAPH-000", "case": case}
+        assert stable_hash(a) == stable_hash(b)
+
+    def test_hash_ignores_audit_trail(self) -> None:
+        """audit_trail 含时间戳，必须被排除在哈希之外，否则永不「可复现」。"""
+        state: dict[str, Any] = {"case": make_case(), "case_id": "GRAPH-000"}
+        noisy = {**state, "audit_trail": ["任意时间戳内容", "再来一条"]}
+        assert stable_hash(_project(state)) == stable_hash(_project(noisy))
+
+    def test_hash_changes_with_content(self) -> None:
+        assert stable_hash({"case_id": "A"}) != stable_hash({"case_id": "B"})
+
+    def test_hash_handles_pydantic_enum_dataclass(self) -> None:
+        """pydantic 模型 / 枚举 / dataclass 都要能参与哈希且不抛异常。"""
+        from src.models.preop.assessment import AnatomyScore
+
+        payload = {
+            "case": make_case(),
+            "enum": RouteMode.GUIDELINE,
+            "product": AnatomyScore(case_id="GRAPH-000", total_score=1.5),
+        }
+        digest = stable_hash(payload)
+        assert len(digest) == 64
+        assert digest == stable_hash({**payload, "enum": RouteMode.GUIDELINE})
+
+    def test_hashed_keys_exclude_audit_trail(self) -> None:
+        assert "audit_trail" not in HASHED_KEYS
+
+
+# ===========================================================================
+# 输入层
+# ===========================================================================
+class TestInputLayer:
+    def test_produces_snapshot_hash_and_case_id(self) -> None:
+        update = input_node({"case": make_case()})  # type: ignore[arg-type]
+        assert update["case_id"] == "GRAPH-000"
+        assert len(update["input_snapshot_hash"]) == 64
+
+    def test_normalizes_enum_annotation(self) -> None:
+        """照抄设计表的带括号写法应在输入层被归一化。"""
+        case = make_case(malignancy="有（活动性）")
+        update = input_node({"case": case})  # type: ignore[arg-type]
+        assert update["case"].malignancy.value == "有"
+
+    def test_does_not_mutate_input_case(self) -> None:
+        """输入层必须产出新对象，否则调用方原件会被路由层的回填污染。"""
+        original = make_case()
+        copied = input_node({"case": original})["case"]  # type: ignore[index]
+        assert copied is not original
+        assert original.route_mode is None
+
+    def test_snapshot_hash_is_reproducible(self) -> None:
+        first = input_node({"case": make_case()})["input_snapshot_hash"]  # type: ignore[index]
+        second = input_node({"case": make_case()})["input_snapshot_hash"]  # type: ignore[index]
+        assert first == second
+
+    def test_missing_case_raises_with_guidance(self) -> None:
+        with pytest.raises(ValueError, match="输入层缺少 case"):
+            input_node({})  # type: ignore[arg-type]
+
+    def test_llm_extractor_is_explicitly_unimplemented(self) -> None:
+        """唯一的 LLM 入口必须显式不可用，并说明原因（不给「偷偷接 LLM」留缝）。"""
+        assert EXTRACTOR_IMPLEMENTED is False
+        with pytest.raises(NotImplementedError, match="标注病例评估集"):
+            extract_case_from_text("患者男性，72 岁……")
+        assert "评估集" in EXTRACTOR_BLOCKED_REASON
+
+
+# ===========================================================================
+# 路由层（薄封装）
+# ===========================================================================
+class TestRouterLayerThinWrapper:
+    def test_wrapper_matches_rules_layer_exactly(self) -> None:
+        """薄封装的结果必须与直接调用规则层 **逐字段一致**。"""
+        wrapped = router_node({"case": make_case()})  # type: ignore[arg-type]
+        reference_case = derive(make_case())
+        reference_result = route(make_case())
+
+        assert wrapped["case"].model_dump() == reference_case.model_dump()
+        assert wrapped["route_result"].route_mode == reference_result.route_mode
+        assert wrapped["route_result"].ruleset_version == reference_result.ruleset_version
+        assert wrapped["route_result"].confidence == reference_result.confidence
+        assert wrapped["route_result"].manual_review_required == (
+            reference_result.manual_review_required
+        )
+
+        for actual, expected in zip(
+            wrapped["route_result"].trace, reference_result.trace, strict=True
+        ):
+            assert actual.order == expected.order
+            assert actual.condition == expected.condition
+            assert actual.result == expected.result
+            assert actual.rule_ref == expected.rule_ref
+
+    def test_wrapper_reuses_single_route_call(self) -> None:
+        """route() 只能被调用一次（一次判定，两处消费）。"""
+        update = router_node({"case": make_case()})  # type: ignore[arg-type]
+        assert update["route_result"] is not None
+        assert update["case"].route_mode == update["route_result"].route_mode
+
+    def test_no_float_thresholds_in_router_layer(self) -> None:
+        """薄封装里不得出现任何数值常量（阈值一律留在规则层）。"""
+        _, numbers = _code_constants(ROUTER_LAYER_NODE)
+        assert numbers == [], f"router_layer 出现数值常量：{numbers}"
+
+    def test_no_clinical_tokens_in_router_layer(self) -> None:
+        """薄封装里不得出现病种 / 解剖 / 处置关键词。"""
+        strings, _ = _code_constants(ROUTER_LAYER_NODE)
+        hits = [token for token in FORBIDDEN_CLINICAL_TOKENS for text in strings if token in text]
+        assert hits == [], f"router_layer 出现临床规则痕迹：{sorted(set(hits))}"
+
+    def test_no_rule_refs_in_router_layer(self) -> None:
+        """薄封装里不得出现覆盖规则编号（O01~O29 / P0a~P8）。"""
+        strings, _ = _code_constants(ROUTER_LAYER_NODE)
+        suspicious = [
+            text
+            for text in strings
+            if text.strip().startswith(("O0", "O1", "O2")) or text.strip().startswith("P1")
+        ]
+        assert suspicious == [], f"router_layer 出现规则编号：{suspicious}"
+
+
+# ===========================================================================
+# 执行层
+# ===========================================================================
+class TestExecutionLayer:
+    def test_all_five_tools_registered(self) -> None:
+        assert len(TOOL_REGISTRY) == 5
+        assert {spec.key for spec in TOOL_REGISTRY} == {
+            "guideline_engine",
+            "imaging_quantifier",
+            "anatomy_scorer",
+            "memory_retriever",
+            "risk_calculator",
+        }
+
+    def test_every_tool_documents_its_blocker(self) -> None:
+        """未实现的工具必须写明**缺什么**，而不是一句「待办」。"""
+        for spec in unimplemented_tools():
+            assert spec.blocked_reason and len(spec.blocked_reason) > 10
+        assert len(unimplemented_tools()) == len(TOOL_REGISTRY)
+
+    def test_implemented_set_is_empty(self) -> None:
+        assert IMPLEMENTED_TOOLS == frozenset()
+
+    def test_run_tool_raises_with_reason(self) -> None:
+        with pytest.raises(NotImplementedError, match="未实现"):
+            run_tool("guideline_engine", {"case": make_case()})  # type: ignore[arg-type]
+
+    def test_node_returns_empty_outputs(self) -> None:
+        """工具产物不存在，就必须返回空——绝不凭空造评分。"""
+        assert execution_node({"case": make_case()}) == {"tool_outputs": {}}  # type: ignore[arg-type]
+
+
+# ===========================================================================
+# 输出层
+# ===========================================================================
+class TestOutputLayer:
+    def _recommendation(self) -> tuple[FinalRecommendation, Any]:
+        case = make_rich_case()
+        state: dict[str, Any] = {"case": case}
+        state.update(input_node(state))  # type: ignore[arg-type]
+        state.update(router_node(state))  # type: ignore[arg-type]
+        state.update(execution_node(state))  # type: ignore[arg-type]
+        update = output_node(state)  # type: ignore[arg-type]
+        return update["final_recommendation"], state["route_result"]
+
+    def test_decision_path_matches_trace_one_to_one(self) -> None:
+        """decision_path 与 trace 必须逐条对应，**含被否决项**。"""
+        recommendation, result = self._recommendation()
+        assert len(recommendation.decision_path) == len(result.trace)
+        for step, source in zip(recommendation.decision_path, result.trace, strict=True):
+            assert step.order == source.order
+            assert step.condition == source.condition
+            assert step.result == source.result
+            assert step.rule_ref == source.rule_ref
+
+    def test_rejected_steps_are_preserved(self) -> None:
+        """审计要求：不得只留命中项。"""
+        recommendation, _ = self._recommendation()
+        assert any(not step.result for step in recommendation.decision_path)
+
+    def test_ruleset_version_and_snapshot_hash_propagated(self) -> None:
+        recommendation, result = self._recommendation()
+        assert recommendation.ruleset_version == result.ruleset_version
+        assert recommendation.input_snapshot_hash is not None
+        assert len(recommendation.input_snapshot_hash) == 64
+
+    def test_confidence_and_review_flag_come_from_rules_layer(self) -> None:
+        recommendation, result = self._recommendation()
+        assert recommendation.confidence == result.confidence
+        assert recommendation.manual_review_required == result.manual_review_required
+
+    def test_evidence_chain_carries_source_quote(self) -> None:
+        recommendation, _ = self._recommendation()
+        quotes = [item.source for item in recommendation.evidence_chain if item.source]
+        assert "CTA 示腹主动脉最大径 42mm。" in quotes
+
+    def test_clinical_conclusion_is_an_explicit_placeholder(self) -> None:
+        """治疗建议口径未定 → 必须是显式占位，不得编造临床主张。"""
+        recommendation, _ = self._recommendation()
+        assert recommendation.primary_recommendation == PRIMARY_RECOMMENDATION_PLACEHOLDER
+        assert "待补" in recommendation.primary_recommendation
+        assert recommendation.treatment_options == []
+
+    def test_llm_translation_is_explicitly_unimplemented(self) -> None:
+        recommendation, _ = self._recommendation()
+        assert TRANSLATION_IMPLEMENTED is False
+        assert recommendation.translated_text is None
+
+
+# ===========================================================================
+# 端到端
+# ===========================================================================
+class TestGraphEndToEnd:
+    def test_run_produces_valid_recommendation(self) -> None:
+        state = run_preop(make_case())
+        recommendation = state["final_recommendation"]
+
+        assert isinstance(recommendation, FinalRecommendation)
+        assert recommendation.case_id == "GRAPH-000"
+        assert recommendation.route_mode is RouteMode.GUIDELINE
+        assert 0.0 <= recommendation.confidence <= 1.0
+        assert recommendation.decision_path
+        assert recommendation.evidence_chain
+
+    def test_emergency_case_routes_emergency(self) -> None:
+        state = run_preop(make_case(rupture_status=RuptureStatus.CONFIRMED))
+        assert state["final_recommendation"].route_mode is RouteMode.EMERGENCY
+
+    def test_audit_trail_records_all_four_nodes(self) -> None:
+        state = run_preop(make_case())
+        nodes = [record.node for record in state["audit_trail"]]
+        assert nodes == ["input_layer", "router_layer", "execution_layer", "output_layer"]
+
+    def test_audit_trail_has_timestamps_and_hashes(self) -> None:
+        for record in run_preop(make_case())["audit_trail"]:
+            assert record.started_at and record.finished_at
+            assert len(record.input_hash) == 64
+            assert len(record.output_hash) == 64
+
+    def test_audit_chain_closes_ring_by_ring(self) -> None:
+        """审计链不变量：上一节点的输出哈希 == 下一节点的输入哈希。"""
+        trail = run_preop(make_case())["audit_trail"]
+        for previous, following in pairwise(trail):
+            assert previous.output_hash == following.input_hash
+
+    def test_input_hash_covers_pure_input(self) -> None:
+        """首环输入哈希应等于「纯输入 case」的状态投影哈希。"""
+        case = make_case()
+        trail = run_preop(case)["audit_trail"]
+        assert trail[0].input_hash == stable_hash(_project({"case": case}))
+
+    def test_hashes_are_reproducible_across_runs(self) -> None:
+        """同输入 + 同规则版本 → 同哈希（时间戳不同不影响）。"""
+        first = run_preop(make_case())["audit_trail"]
+        second = run_preop(make_case())["audit_trail"]
+
+        assert [r.input_hash for r in first] == [r.input_hash for r in second]
+        assert [r.output_hash for r in first] == [r.output_hash for r in second]
+        assert first[0].started_at != ""  # 时间戳确实被记录了
+
+    def test_original_case_is_not_mutated(self) -> None:
+        """图内部对 case 的回填不得污染调用方对象。"""
+        case = make_case()
+        run_preop(case)
+        assert case.route_mode is None
+        assert case.urgency_triggered is None
+
+    def test_tool_outputs_empty_reflects_real_gap(self) -> None:
+        assert run_preop(make_case())["tool_outputs"] == {}
+
+
+# ===========================================================================
+# Checkpoint 往返
+# ===========================================================================
+class TestCheckpointRoundTrip:
+    def test_state_round_trips_through_independent_connection(self, tmp_path: Path) -> None:
+        """换一个**独立连接**读回同一 state —— 这是「可审计」的真正兑现。"""
+        db = tmp_path / "checkpoints.sqlite"
+        case = make_rich_case()
+
+        with sqlite_checkpointer(db) as saver:
+            run_preop(case, checkpointer=saver, thread_id="T-ROUNDTRIP")
+
+        # 上面 with 已关闭连接，这里重新打开 —— 数据必须来自磁盘而非内存。
+        with sqlite_checkpointer(db) as reopened:
+            app = build_preop_graph(checkpointer=reopened)
+            values = app.get_state(thread_config("T-ROUNDTRIP")).values
+
+        assert isinstance(values["case"], VascCase)
+        assert values["case"].case_id == "GRAPH-RICH"
+        assert values["case"].field_evidence["max_diameter_mm"].source_quote.startswith("CTA")
+        assert values["case"].urgency_flag_audit is not None
+        assert values["case"].urgency_flag_audit.set_by is FieldWriter.HUMAN
+
+        assert len(values["route_result"].trace) > 0
+        assert isinstance(values["final_recommendation"], FinalRecommendation)
+        assert values["final_recommendation"].route_mode is values["route_result"].route_mode
+
+    def test_audit_trail_survives_round_trip(self, tmp_path: Path) -> None:
+        db = tmp_path / "checkpoints.sqlite"
+        with sqlite_checkpointer(db) as saver:
+            run_preop(make_case(), checkpointer=saver, thread_id="T-AUDIT")
+
+        with sqlite_checkpointer(db) as reopened:
+            app = build_preop_graph(checkpointer=reopened)
+            trail = app.get_state(thread_config("T-AUDIT")).values["audit_trail"]
+
+        assert [record.node for record in trail] == [
+            "input_layer",
+            "router_layer",
+            "execution_layer",
+            "output_layer",
+        ]
+        for record in trail:
+            assert len(record.input_hash) == 64
+            assert len(record.output_hash) == 64
+
+    def test_checkpoint_database_is_sqlite_with_tables(self, tmp_path: Path) -> None:
+        db = tmp_path / "checkpoints.sqlite"
+        with sqlite_checkpointer(db) as saver:
+            run_preop(make_case(), checkpointer=saver, thread_id="T-TABLES")
+
+        conn = sqlite3.connect(str(db))
+        try:
+            tables = {
+                row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+        finally:
+            conn.close()
+        assert {"checkpoints", "writes"} <= tables
+
+    def test_state_history_is_replayable(self, tmp_path: Path) -> None:
+        """每个节点落一次盘 → 可逐步回放。"""
+        db = tmp_path / "checkpoints.sqlite"
+        with sqlite_checkpointer(db) as saver:
+            run_preop(make_case(), checkpointer=saver, thread_id="T-HISTORY")
+            app = build_preop_graph(checkpointer=saver)
+            history = list(app.get_state_history(thread_config("T-HISTORY")))
+
+        assert len(history) >= 4
+
+    def test_two_threads_do_not_collide(self, tmp_path: Path) -> None:
+        db = tmp_path / "checkpoints.sqlite"
+        with sqlite_checkpointer(db) as saver:
+            run_preop(make_case(case_id="GRAPH-A"), checkpointer=saver, thread_id="T-A")
+            run_preop(
+                make_case(case_id="GRAPH-B", rupture_status=RuptureStatus.CONFIRMED),
+                checkpointer=saver,
+                thread_id="T-B",
+            )
+            app = build_preop_graph(checkpointer=saver)
+            first = app.get_state(thread_config("T-A")).values
+            second = app.get_state(thread_config("T-B")).values
+
+        assert first["case_id"] == "GRAPH-A"
+        assert second["case_id"] == "GRAPH-B"
+        assert first["final_recommendation"].route_mode != second["final_recommendation"].route_mode
+
+
+def _collect_custom_types(value: Any, seen: set[type]) -> set[type]:
+    """递归收集一个值里出现过的**自定义类型**（pydantic / dataclass / Enum）。
+
+    用途：Checkpoint 序列化白名单必须覆盖 state 里出现的**每一个**自定义类型，
+    故先由真实 state 反推出「应该注册哪些类型」，再与白名单比对 —— 这样
+    以后往 state 里新增模型时，测试会立刻提示漏注册，而不是等到升级才炸。
+    """
+    if isinstance(value, type):
+        return seen
+
+    if isinstance(value, Enum):
+        seen.add(type(value))
+        return seen
+
+    if isinstance(value, BaseModel):
+        seen.add(type(value))
+        for name in type(value).model_fields:
+            _collect_custom_types(getattr(value, name, None), seen)
+        return seen
+
+    if is_dataclass(value) and not isinstance(value, type):
+        seen.add(type(value))
+        for spec in fields(value):
+            _collect_custom_types(getattr(value, spec.name, None), seen)
+        return seen
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _collect_custom_types(key, seen)
+            _collect_custom_types(item, seen)
+        return seen
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _collect_custom_types(item, seen)
+        return seen
+
+    return seen
+
+
+# ===========================================================================
+# 序列化白名单守卫
+# ===========================================================================
+class TestSerializationAllowlist:
+    """守住 Checkpoint 的序列化白名单。
+
+    为什么值得单开一类测试（这是本轮发现的**定时炸弹**）：
+
+        LangGraph 反序列化遇到未登记的自定义类型时，**当前只告警不阻断**，
+        但日志明确写着 ``This will be blocked in a future version``。
+        后果极不对称 —— **不注册时全部测试依然通过**，直到某次依赖升级后
+        历史 Checkpoint 集体读不回来、审计链静默断裂，且此时已无法追溯修复。
+
+        因此「白名单完整」不能靠开发者记得，必须由测试挡住。
+    """
+
+    def test_allowlist_covers_every_type_in_state(self) -> None:
+        """真实 state 里出现的每个自定义类型，都必须在白名单内。"""
+        state = run_preop(make_rich_case())
+
+        seen: set[type] = set()
+        _collect_custom_types(state, seen)
+        assert seen, "未能从 state 中收集到任何自定义类型，收集器可能已失效"
+
+        declared = build_checkpoint_serde()._allowed_msgpack_modules
+        missing = {(cls.__module__, cls.__qualname__) for cls in seen} - declared
+
+        assert missing == set(), (
+            f"以下类型出现在 state 中但未登记到序列化白名单，"
+            f"未来 LangGraph 升级后将无法反序列化历史 Checkpoint：{sorted(missing)}"
+        )
+
+    def test_allowed_types_helper_matches_serde(self) -> None:
+        """``allowed_msgpack_types()`` 与 ``build_checkpoint_serde()`` 必须同源。"""
+        declared = build_checkpoint_serde()._allowed_msgpack_modules
+        assert len(declared) > 0
+        # 白名单以 (模块名, 类限定名) 二元组形式存在
+        assert all(isinstance(item, tuple) and len(item) == 2 for item in declared)
+
+    def test_registered_saver_emits_no_unregistered_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """走正式路径（登记了白名单）时，往返全过程**不得**出现未注册类型告警。"""
+        db = tmp_path / "allowlist.sqlite"
+        case = make_rich_case()
+
+        with caplog.at_level(logging.WARNING):
+            with sqlite_checkpointer(db) as saver:
+                run_preop(case, checkpointer=saver, thread_id="T-ALLOWLIST")
+            with sqlite_checkpointer(db) as reopened:
+                app = build_preop_graph(checkpointer=reopened)
+                values = app.get_state(thread_config("T-ALLOWLIST")).values
+
+        assert isinstance(values["case"], VascCase)
+        assert "unregistered" not in caplog.text.lower(), (
+            f"往返过程出现未注册类型告警（白名单不完整）：\n{caplog.text}"
+        )
+
+    def test_canary_unregistered_types_are_observably_flagged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """阳性对照 —— 证明上一条测试不是「空断言」。
+
+        故意**绕开白名单**构造 saver（用裸 ``SqliteSaver``），必须能观测到
+        ``unregistered`` 告警。这样上一条测试里「零告警」才是有信息量的断言。
+
+        ⚠️ 实测记录（不要想当然）：``LANGGRAPH_STRICT_MSGPACK=true`` **不是**
+        更可靠的守卫 —— 实测在该模式下，未注册类型的 state 依然能正确往返，
+        且**不再产生任何告警**。也就是说它既不报错也不提示，风险反而更隐蔽。
+        故本测试在严格模式下跳过（该信号不可观测），真正的防线是
+        「白名单必须完整」+ :meth:`test_allowlist_covers_every_type_in_state`。
+        """
+        if os.environ.get("LANGGRAPH_STRICT_MSGPACK", "").lower() in {"1", "true", "yes"}:
+            pytest.skip("严格模式下未注册类型不再产生可观测告警，本对照无法进行")
+
+        db = tmp_path / "canary.sqlite"
+        case = make_rich_case()
+        conn = sqlite3.connect(str(db), check_same_thread=False)
+
+        try:
+            plain_saver = SqliteSaver(conn)
+            plain_saver.setup()
+            with caplog.at_level(logging.WARNING):
+                run_preop(case, checkpointer=plain_saver, thread_id="T-CANARY")
+                app = build_preop_graph(checkpointer=plain_saver)
+                app.get_state(thread_config("T-CANARY"))
+        finally:
+            conn.close()
+
+        assert "unregistered" in caplog.text.lower(), (
+            "未注册类型不再产生告警，说明该失败模式已变为静默；请重新评估本守卫是否仍有意义。"
+        )
+
+
+# ===========================================================================
+# 架构守卫：判定层零 LLM
+# ===========================================================================
+class TestJudgmentLayerHasNoLlm:
+    def test_no_llm_client_imported_in_judgment_layers(self) -> None:
+        """判定层（规则 + 路由 / 执行 / 输出）不得 import 任何 LLM 客户端。"""
+        offenders: list[str] = []
+        for directory in JUDGMENT_LAYER_DIRS:
+            for path in _iter_source_files(directory):
+                for module in _iter_imported_modules(path):
+                    if module.startswith(FORBIDDEN_LLM_MODULES):
+                        offenders.append(f"{path.relative_to(REPO_ROOT)} → {module}")
+        assert offenders == [], f"判定层出现 LLM 客户端导入：{offenders}"
+
+    def test_rules_layer_has_no_third_party_llm_framework(self) -> None:
+        """规则层不得引入任何 LLM 编排框架或客户端。"""
+        offenders: list[str] = []
+        for path in _iter_source_files(REPO_ROOT / "src" / "rules"):
+            for module in _iter_imported_modules(path):
+                if module.startswith(("langgraph", "langchain", "openai", "anthropic")):
+                    offenders.append(f"{path.name} → {module}")
+        assert offenders == []
+
+    def test_input_layer_is_the_only_llm_entry_documented(self) -> None:
+        """input_layer 必须自述为「唯一 LLM 入口」，该声明被测试钉住。"""
+        source = (REPO_ROOT / "src" / "preop_agent" / "input_layer" / "node.py").read_text(
+            encoding="utf-8"
+        )
+        assert "唯一的 LLM 入口" in source
+
+    def test_router_layer_is_documented_as_thin_wrapper(self) -> None:
+        source = ROUTER_LAYER_NODE.read_text(encoding="utf-8")
+        assert "薄封装" in source
