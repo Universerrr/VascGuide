@@ -11,6 +11,32 @@
     P1 急诊 → P2 特殊病变 → P3 复杂解剖 → P4 严重合并症 → P5 证据冲突 →
     P6 字段缺失 → P7/P8 指南。优先级 急诊 > 复杂 > 指南。
 
+note 文本契约（审计证据粒度，供渲染/审计层解析；改动须同步本契约）：
+    **未命中**步骤的 ``note`` 形如 ``<结论句>（<检查项>；<检查项>；…）``，
+    全角括号包裹、全角分号分隔。检查项分三类：
+      · 数值判据：``<中文名> <值><单位> <比较符> <阈值><单位>``
+        例：``瘤颈长度 25.0mm ≥ 15.0mm``
+      · 布尔/三态：``<中文名> <取值>``；显式置位标志记 ``未置位``
+      · 枚举/列表：``<中文名> <中文取值>``，多值以 ``、`` 连接，缺失记 ``未提及``
+      · 字段缺失时，数值判据**只记 ``未提及``、不附比较符**——写成
+        ``未提及 ≥ 15mm`` 是伪陈述（无值可比），会误导复核者。
+    检查项内部如需补充说明，用全角逗号 ``，``（与项间分隔符 ``；`` 区分）。
+    目的：使「该步为何**未**命中」可由第三方独立复核（对照值与阈值自行验算），
+    而非只能采信结论句。命中步骤的 note 保持原有「编号 + 值 + 阈值」写法。
+
+缺失值语义契约（**未提及 ≠ 无**，判定口径；改动须同步本契约）：
+    ``None`` 代表「**未提及**」（没查 / 没写 / 抽取失败），与「**明确为否**」是
+    两回事，不得合并处理：
+      · 明确为否（``EndoleakType.NONE``「无内漏」、``PriorRepair.NONE``「无既往修复」
+        等）是**已核实的事实**，可支撑**放行**判定；
+      · 未提及是**数据缺口**，不得支撑任何「安全侧」结论，一律按**不确定**处理，
+        走否决 / 兜底路径。
+    实现纪律：**禁止用 ``if field is not None:`` 作放行守卫**。该写法会让 ``None``
+    跌出分支、落到下游的放行出口，等价于把「没查」当成「查过了且正常」。
+    正确写法是**白名单正列举**：只有明确取值才放行，其余（含 ``None``）落拒绝分支。
+    反面教材（已修，table2@v1.6）：P7 术后内漏分支原用 ``and endoleak_type is not None``
+    守卫，导致「内漏类型未提及」的随访病例被下游出口放行为指南模式 + 免人工复核。
+
 返回值：
     ``RouteResult`` —— 结构化路由结论 + 逐步判定轨迹（供审计落盘）。
 本模块不得 import 任何 LLM 客户端（治理红线）。
@@ -153,6 +179,37 @@ def _is_truthy(v: object) -> bool:
     return getattr(v, "value", v) == AFFIRMATIVE_VALUE
 
 
+def _fmt(value: object, unit: str = "") -> str:
+    """把字段值渲染为 ``note`` 文本（**仅用于文案，不参与任何判定**）。
+
+    规则：枚举取 ``value``（中文取值）；列表以 ``、`` 连接（空列表记 ``空``）；
+    ``None`` 统一记 ``未提及``；``unit`` 仅用于数值字段拼接单位。
+    """
+    if value is None:
+        return "未提及"
+    if isinstance(value, (list, tuple)):
+        return "、".join(_fmt(v) for v in value) or "空"
+    return f"{getattr(value, 'value', value)}{unit}"
+
+
+def _checks(*items: str) -> str:
+    """把检查项拼成 ``note`` 契约要求的后缀 ``（…；…；…）``。
+
+    分隔符与包裹符在此**唯一定义**，渲染层可按它切分（见模块文档 note 契约）。
+    """
+    return "（" + "；".join(items) + "）"
+
+
+def _cmp(value: object, unit: str, op: str, threshold: str) -> str:
+    """数值判据渲染：有值 → ``<值><单位> <比较符> <阈值>``；字段缺失 → ``未提及``。
+
+    缺失时刻意**不附比较符**：``未提及 ≥ 15mm`` 是无意义的伪陈述。
+    """
+    if value is None:
+        return "未提及"
+    return f"{value}{unit} {op} {threshold}"
+
+
 def collect_missing_critical_fields(case: VascCase) -> list[str]:
     """收集缺失的关键事实层字段（O25 / CRITICAL_FACT_FIELDS）。
 
@@ -200,7 +257,12 @@ def step_p1_emergency(case: VascCase) -> tuple[bool, str]:
         if _is_truthy(getattr(case, attr, None)):
             return True, f"P1·{rule} {label} = 有"
 
-    return False, "P1 无急诊触发"
+    return False, "P1 无急诊触发" + _checks(
+        "急症标志 未置位",
+        f"破裂状态 {_fmt(case.rupture_status)}",
+        f"AAA 归因性症状 {_fmt(case.symptom_aaa_related)}",
+        "循环不稳/活动性出血/急性肢体缺血/灌注障碍/脓毒性休克 均无",
+    )
 
 
 def step_p2_special(case: VascCase) -> tuple[bool, str]:
@@ -241,7 +303,15 @@ def step_p2_special(case: VascCase) -> tuple[bool, str]:
     if case.postop_complication and any(k in case.postop_complication for k in ("感染", "瘘")):
         return True, "P2·O21 术后感染/瘘并发症"
 
-    return False, "P2 无特殊病变"
+    return False, "P2 无特殊病变" + _checks(
+        f"感染证据 {_fmt(case.infection_evidence)}",
+        f"炎症证据 {_fmt(case.inflammatory_evidence)}",
+        f"遗传/结缔组织病 {_fmt(case.genetic_syndrome)}",
+        f"恶性肿瘤 {_fmt(case.malignancy)}",
+        "特殊病变线索 未命中",
+        f"病种 {_fmt(case.disease_category)}",
+        "术后并发症 未含感染/瘘线索",
+    )
 
 
 def step_p3_complex_anatomy(case: VascCase) -> tuple[bool, str]:
@@ -297,7 +367,19 @@ def step_p3_complex_anatomy(case: VascCase) -> tuple[bool, str]:
     if DiseaseCategory.ASYMPTOMATIC in cats and DiseaseCategory.ILIAC_ANEURYSM in cats:
         return True, "P3·表1 L02 AAA 合并髂动脉瘤"
 
-    return False, "P3 解剖/手术复杂度未达阈值"
+    return False, "P3 解剖/手术复杂度未达阈值" + _checks(
+        f"瘤颈长度 {_cmp(case.neck_length_mm, 'mm', '≥', f'{NECK_LENGTH_THRESHOLD_MM}mm')}",
+        f"瘤颈成角 {_cmp(case.neck_angle_deg, '°', '≤', f'{NECK_ANGLE_THRESHOLD_DEG}°')}",
+        f"入路直径 {_cmp(case.access_diameter_mm, 'mm', '≥', f'{ACCESS_DIAMETER_THRESHOLD_MM}mm')}",
+        "瘤颈血栓/钙化 "
+        f"{_cmp(case.neck_thrombus_calc_pct, '%', '≤', f'{NECK_THROMBUS_CALC_THRESHOLD_PCT}%')}",
+        f"迂曲/极度成角 {_fmt(case.tortuosity)}",
+        f"年增长率 {_cmp(case.growth_rate_mm_per_year, 'mm/年', '<', '10mm/年')}",
+        f"解剖分型 {_fmt(case.anatomy_level)}",
+        f"既往修复史 {_fmt(case.prior_repair)}",
+        "术后并发症 未含复杂关键词",
+        f"病种 {_fmt(case.disease_category)}，未合并髂动脉瘤",
+    )
 
 
 def step_p4_comorbidity(case: VascCase) -> tuple[bool, str]:
@@ -311,39 +393,58 @@ def step_p4_comorbidity(case: VascCase) -> tuple[bool, str]:
         return True, f"P4·O13 CKD {case.ckd_stage.value} 期 ≥ 3"
     if _is_truthy(case.cad):
         return True, "P4·O14 冠心病 CAD = 有"
-    return False, "P4 无严重合并症"
+    return False, "P4 无严重合并症" + _checks(
+        f"心衰 {_fmt(case.heart_failure_nyha, ' 级')}，阈值 ≥ III 级",
+        f"COPD {_fmt(case.copd)}",
+        f"CKD {_fmt(case.ckd_stage, ' 期')}，阈值 ≥ 3 期",
+        f"冠心病 CAD {_fmt(case.cad)}",
+    )
 
 
 def step_p5_conflict(case: VascCase) -> tuple[bool, str]:
     """P5 证据冲突（O24）。"""
     if _is_truthy(case.evidence_conflict):
         return True, "P5·O24 指南与影像证据冲突"
-    return False, "P5 无证据冲突"
+    return False, "P5 无证据冲突" + _checks(f"证据冲突标志 {_fmt(case.evidence_conflict)}")
 
 
 def step_p6_missing(case: VascCase, missing: list[str]) -> tuple[bool, str]:
     """P6 关键字段缺失 / 病种无法识别（O25）。"""
+    from ..models.preop.case import CRITICAL_FACT_FIELDS
+
     if missing:
         return True, f"P6·O25 关键字段缺失：{'、'.join(missing)}"
     if not case.disease_category:
         return True, "P6·O25 病种无法识别（disease_category 为空）"
-    return False, "P6 关键字段齐全"
+    return False, "P6 关键字段齐全" + _checks(
+        f"{len(CRITICAL_FACT_FIELDS)} 项关键字段均已填：{'、'.join(CRITICAL_FACT_FIELDS)}",
+        f"病种 {_fmt(case.disease_category)}",
+    )
 
 
 def step_p7_guideline(case: VascCase) -> tuple[bool, str]:
     """P7 低复杂度常规指南场景（O26）。"""
     cats = set(case.disease_category or [])
     if not (cats & GUIDELINE_CATEGORIES):
-        return False, "P7 不属于常规指南病种"
+        return False, "P7 不属于常规指南病种" + _checks(
+            f"病种 {_fmt(case.disease_category)}",
+            "常规指南病种：无症状 AAA / 孤立性髂动脉瘤 / 术后随访",
+        )
 
-    # 术后病种：内漏类型决定归属（表2 T10）
-    #   无内漏 / 稳定Ⅱ型 → 指南；Ⅰ/Ⅲ型高危 → 已由 P3 拦截为复杂，
-    #   此处仅对「非稳定内漏」显式否决。
-    if DiseaseCategory.POSTOPERATIVE in cats and case.endoleak_type is not None:
+    # 术后病种：内漏类型决定归属（表2 T10）——**白名单正列举**，不是 `is not None` 守卫。
+    #   只有「无内漏」/「稳定Ⅱ型」放行指南；其余（含未提及 / 不明 / Ⅰ型 / Ⅲ型 / Ⅳ型）
+    #   一律否决 → 由 P7b 兜底为复杂 + 人工复核（不得默认「稳定」）。
+    #   ⚠️ 未提及（None）≠ 无内漏（EndoleakType.NONE）：前者是数据缺口，不是「已排除内漏」。
+    #      若写成 `and case.endoleak_type is not None`，None 会跌出本分支、被下方
+    #      「低复杂度指南病种」出口当作稳定随访放行（实测：指南 + 免人工复核 + 0.90）。
+    if DiseaseCategory.POSTOPERATIVE in cats:
         et = case.endoleak_type
         if et in (EndoleakType.NONE, EndoleakType.II):
             return True, f"P7·O26 术后随访内漏状态 = {et.value}（稳定）"
-        return False, f"P7·O26 术后内漏类型 {et.value}（非稳定Ⅱ型）"
+        return False, "P7·O26 术后内漏类型非稳定Ⅱ型" + _checks(
+            f"内漏类型 {_fmt(et)}",
+            "稳定取值：无内漏 / Ⅱ型，未提及 ≠ 无内漏",
+        )
 
     hit = cats & GUIDELINE_CATEGORIES
     return True, f"P7·O26 低复杂度指南病种：{'、'.join(c.value for c in hit)}"
@@ -352,7 +453,10 @@ def step_p7_guideline(case: VascCase) -> tuple[bool, str]:
 def step_p8_prerequisites(case: VascCase, missing: list[str]) -> tuple[bool, str]:
     """P8 全部适用前置条件已核实（O26, O27）。"""
     if missing:
-        return False, f"P8 前置未满足：仍缺 {len(missing)} 个关键字段"
+        return False, (
+            f"P8 前置未满足：仍缺 {len(missing)} 个关键字段"
+            + _checks(f"缺失字段：{'、'.join(missing)}")
+        )
     return True, "P8·O27 前置条件齐备，资料完整"
 
 
@@ -437,8 +541,11 @@ def route(case: VascCase) -> RouteResult:
     hit, note = step_p7_guideline(case)
     trace.append(StepTrace("P7", "是否属于低复杂度常规指南场景？", hit, "O26", note))
     if not hit:
-        # 非指南病种且 P1~P6 均未命中 —— 兜底为复杂（不得默认「稳定」）
-        note_fallback = "P7 未命中指南病种，且急诊/复杂均未触发 → 兜底复杂模式"
+        # P7 未确立指南场景（病种不属常规指南，**或**术后内漏状态不可确认稳定），
+        # 且 P1~P6 均未命中 —— 兜底为复杂（不得默认「稳定」）
+        note_fallback = (
+            "P7 未确立指南场景（病种或术后内漏状态不满足 O26），且 P1~P6 均未触发 → 兜底复杂模式"
+        )
         trace.append(StepTrace("P7b", "兜底判定", True, "O25", note_fallback))
         return _build(
             RouteMode.COMPLEX, note_fallback, case, missing, trace, False, manual_review=True
