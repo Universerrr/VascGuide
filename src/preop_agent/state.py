@@ -37,6 +37,7 @@ from ..rules.router import RouteResult
 __all__ = [
     "HASHED_KEYS",
     "NodeAudit",
+    "PreopRunResult",
     "PreopState",
     "audited",
     "stable_hash",
@@ -71,6 +72,36 @@ class PreopState(TypedDict, total=False):
     tool_outputs: dict[str, Any]
     final_recommendation: FinalRecommendation
     audit_trail: Annotated[list[NodeAudit], operator.add]
+
+
+class PreopRunResult(PreopState, total=False):
+    """``run_preop`` 的返回值：图状态 + **运行期元信息**。
+
+    为什么要独立一个类型，而不是把元信息塞进 :class:`PreopState`：
+
+        ``PreopState`` 的 7 个字段全是「**关于这一例病例的真相**」—— 病例事实、
+        路由结论、决策产物、审计轨迹。而下面两个字段回答的是「**这次调用是怎么
+        跑的**」—— 有没有落盘、落在哪条线程，属**调用方元信息 / 工程开关**，
+        与病例无关。混进 ``PreopState`` 会造成语义污染：后来的读者（或未来的
+        检索者）可能把「本次没落盘」误当成临床事实的一部分。
+
+    两个字段：
+        · ``audit_persisted``：本次是否落盘；
+        · ``thread_id``：本次实际使用的线程标识（派生值含时间戳，调用方算不出来，
+          必须回传，否则自动派生的线程就成了「写进去但捞不出来」的死记录）。
+
+    三条边界（都有测试守住）：
+        · **不进** :data:`HASHED_KEYS` —— 不参与审计哈希，改它不会改变任何哈希；
+        · **不进** checkpoint —— 它们在 ``invoke()`` **返回之后**注入，LangGraph
+          落盘的只有「被节点写过的通道」，故这两个键不会出现在任何快照里；
+        · **不是**节点通道 —— 任何节点都读不到它们，节点逻辑无从依赖它们。
+
+    ``total=False``：继承 :class:`PreopState` 的可选性，且新字段本身可缺省
+    （非 ``run_preop`` 路径产出的状态字典里不会有这些键）。
+    """
+
+    audit_persisted: bool
+    thread_id: str
 
 
 # 参与哈希的字段：**排除 audit_trail**。

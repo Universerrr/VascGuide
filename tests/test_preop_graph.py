@@ -46,6 +46,7 @@ from src.models.enums import (
 )
 from src.models.preop.case import VascCase, derive
 from src.models.preop.recommendation import FinalRecommendation
+from src.preop_agent import graph as graph_module
 from src.preop_agent.execution_layer.node import (
     IMPLEMENTED_TOOLS,
     TOOL_REGISTRY,
@@ -443,7 +444,7 @@ class TestOutputLayer:
 # ===========================================================================
 class TestGraphEndToEnd:
     def test_run_produces_valid_recommendation(self) -> None:
-        state = run_preop(make_case())
+        state = run_preop(make_case(), checkpointer=None)
         recommendation = state["final_recommendation"]
 
         assert isinstance(recommendation, FinalRecommendation)
@@ -454,36 +455,36 @@ class TestGraphEndToEnd:
         assert recommendation.evidence_chain
 
     def test_emergency_case_routes_emergency(self) -> None:
-        state = run_preop(make_case(rupture_status=RuptureStatus.CONFIRMED))
+        state = run_preop(make_case(rupture_status=RuptureStatus.CONFIRMED), checkpointer=None)
         assert state["final_recommendation"].route_mode is RouteMode.EMERGENCY
 
     def test_audit_trail_records_all_four_nodes(self) -> None:
-        state = run_preop(make_case())
+        state = run_preop(make_case(), checkpointer=None)
         nodes = [record.node for record in state["audit_trail"]]
         assert nodes == ["input_layer", "router_layer", "execution_layer", "output_layer"]
 
     def test_audit_trail_has_timestamps_and_hashes(self) -> None:
-        for record in run_preop(make_case())["audit_trail"]:
+        for record in run_preop(make_case(), checkpointer=None)["audit_trail"]:
             assert record.started_at and record.finished_at
             assert len(record.input_hash) == 64
             assert len(record.output_hash) == 64
 
     def test_audit_chain_closes_ring_by_ring(self) -> None:
         """审计链不变量：上一节点的输出哈希 == 下一节点的输入哈希。"""
-        trail = run_preop(make_case())["audit_trail"]
+        trail = run_preop(make_case(), checkpointer=None)["audit_trail"]
         for previous, following in pairwise(trail):
             assert previous.output_hash == following.input_hash
 
     def test_input_hash_covers_pure_input(self) -> None:
         """首环输入哈希应等于「纯输入 case」的状态投影哈希。"""
         case = make_case()
-        trail = run_preop(case)["audit_trail"]
+        trail = run_preop(case, checkpointer=None)["audit_trail"]
         assert trail[0].input_hash == stable_hash(_project({"case": case}))
 
     def test_hashes_are_reproducible_across_runs(self) -> None:
         """同输入 + 同规则版本 → 同哈希（时间戳不同不影响）。"""
-        first = run_preop(make_case())["audit_trail"]
-        second = run_preop(make_case())["audit_trail"]
+        first = run_preop(make_case(), checkpointer=None)["audit_trail"]
+        second = run_preop(make_case(), checkpointer=None)["audit_trail"]
 
         assert [r.input_hash for r in first] == [r.input_hash for r in second]
         assert [r.output_hash for r in first] == [r.output_hash for r in second]
@@ -492,12 +493,12 @@ class TestGraphEndToEnd:
     def test_original_case_is_not_mutated(self) -> None:
         """图内部对 case 的回填不得污染调用方对象。"""
         case = make_case()
-        run_preop(case)
+        run_preop(case, checkpointer=None)
         assert case.route_mode is None
         assert case.urgency_triggered is None
 
     def test_tool_outputs_empty_reflects_real_gap(self) -> None:
-        assert run_preop(make_case())["tool_outputs"] == {}
+        assert run_preop(make_case(), checkpointer=None)["tool_outputs"] == {}
 
 
 # ===========================================================================
@@ -629,6 +630,223 @@ def _collect_custom_types(value: Any, seen: set[type]) -> set[type]:
 
 
 # ===========================================================================
+# 落盘策略（默认落盘 + 显式放弃时告警）
+# ===========================================================================
+class TestPersistencePolicy:
+    """``run_preop`` 的落盘语义：「默认即安全」+ 放弃落盘必须出声。
+
+    改造前 ``checkpointer`` 默认 ``None``，即「不传就不落盘」，且**毫无提示** ——
+    属静默 fail-open，与「全程可审计」红线冲突。改造后：
+        · 不传 → 落盘到 :data:`..graph.DEFAULT_CHECKPOINT_DB`；
+        · 显式 ``None`` → 不落盘，且 ``logging.warning`` 出声（fail-loud）。
+    本类把这几条语义钉成测试；``thread_id`` 的派生语义见 :class:`TestRunIsolation`。
+    """
+
+    def test_default_call_persists_to_default_db(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """不传 checkpointer → 默认落盘。用 monkeypatch 把默认库导向 tmp_path。"""
+        db = tmp_path / "default.sqlite"
+        monkeypatch.setattr(graph_module, "DEFAULT_CHECKPOINT_DB", db)
+
+        result = run_preop(make_case())
+
+        assert db.exists(), "默认调用必须产生审计库文件"
+        assert result["audit_persisted"] is True
+        assert len(result["audit_trail"]) == 4
+
+    def test_explicit_none_does_not_persist_and_warns(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """显式 ``checkpointer=None`` → 不落盘，且必须出声（fail-loud 而非 fail-open）。"""
+        db = tmp_path / "default.sqlite"
+        monkeypatch.setattr(graph_module, "DEFAULT_CHECKPOINT_DB", db)
+
+        with caplog.at_level(logging.WARNING):
+            result = run_preop(make_case(), checkpointer=None)
+
+        assert result["audit_persisted"] is False
+        assert not db.exists(), "显式放弃落盘时不得创建任何库文件"
+        assert any("未落盘" in record.getMessage() for record in caplog.records)
+
+    def test_thread_id_is_derived_per_run_and_returned(self, tmp_path: Path) -> None:
+        """不传 thread_id → 派生 ``preop:{case_id}:{run_id}``，并**从返回值读回**。
+
+        为什么必须回传：run_id 含时间戳，调用方无法预先算出。若不回传，
+        自动派生的线程就是「写进去了但捞不出来」的死记录。
+        """
+        db = tmp_path / "checkpoints.sqlite"
+        case = make_case(case_id="GRAPH-THREAD")
+
+        with sqlite_checkpointer(db) as saver:
+            result = run_preop(case, checkpointer=saver)
+
+        thread_id = result["thread_id"]
+        assert thread_id.startswith("preop:GRAPH-THREAD:"), thread_id
+
+        with sqlite_checkpointer(db) as reopened:
+            app = build_preop_graph(checkpointer=reopened)
+            values = app.get_state(thread_config(thread_id)).values
+
+        assert values["case_id"] == "GRAPH-THREAD"
+
+    def test_explicit_thread_id_overrides_derivation(self, tmp_path: Path) -> None:
+        """显式传入的 thread_id 覆盖派生值。"""
+        db = tmp_path / "checkpoints.sqlite"
+        case = make_case(case_id="GRAPH-OVERRIDE")
+
+        with sqlite_checkpointer(db) as saver:
+            result = run_preop(case, checkpointer=saver, thread_id="T-EXPLICIT")
+
+        assert result["thread_id"] == "T-EXPLICIT"
+
+        with sqlite_checkpointer(db) as reopened:
+            app = build_preop_graph(checkpointer=reopened)
+            values = app.get_state(thread_config("T-EXPLICIT")).values
+
+        assert values["case_id"] == "GRAPH-OVERRIDE"
+
+    def test_two_cases_do_not_share_a_thread(self, tmp_path: Path) -> None:
+        """派生 thread 的核心收益：不同病例互不污染审计轨迹。"""
+        db = tmp_path / "checkpoints.sqlite"
+
+        with sqlite_checkpointer(db) as saver:
+            first = run_preop(make_case(case_id="GRAPH-X"), checkpointer=saver)
+            second = run_preop(make_case(case_id="GRAPH-Y"), checkpointer=saver)
+
+        assert len(first["audit_trail"]) == 4
+        assert len(second["audit_trail"]) == 4, "第二例不得累积第一例的审计帧"
+
+    def test_audit_persisted_stays_out_of_checkpoint(self, tmp_path: Path) -> None:
+        """运行期元信息不得进 checkpoint —— 库里只应有「关于病例的真相」。"""
+        db = tmp_path / "checkpoints.sqlite"
+        with sqlite_checkpointer(db) as saver:
+            run_preop(make_case(), checkpointer=saver, thread_id="T-META")
+
+        with sqlite_checkpointer(db) as reopened:
+            app = build_preop_graph(checkpointer=reopened)
+            values = app.get_state(thread_config("T-META")).values
+
+        assert "audit_persisted" not in values
+
+    def test_audit_persisted_is_not_hashed(self) -> None:
+        """元信息不参与审计哈希 —— 改它不得影响任何哈希。"""
+        assert "audit_persisted" not in HASHED_KEYS
+
+
+# ===========================================================================
+# 运行隔离（一次运行 = 一条线程）
+# ===========================================================================
+class TestRunIsolation:
+    """同病例重复运行不得互相污染审计轨迹。
+
+    为什么单独立类：这是「默认落盘」与「thread 由 case_id 派生」两个改动**叠加后**
+    才显形的问题 —— 修复前，同一 ``case_id`` 第二次调用会把上一次的 4 帧审计记录
+    一并带回（4 帧 → 8 帧），审计链不变量随之断裂；病例被修订后重跑，断链还会更早。
+
+    根因在语义层：``thread_id`` 在 LangGraph 里是**状态机线程**，对同一 thread 再
+    ``invoke`` 是 **resume**（续跑），不是「新开一次运行」。修复方式是把「运行身份」
+    显式编入 ``thread_id`` —— 默认路径「一运行一线程」，而 resume 只在**显式传入**
+    ``thread_id`` 时发生（那是调用方主动要求续跑 / 回放）。
+
+    这组用例必须在 ``tmp_path`` 之外另有一条理由：缺陷只在「同一 thread 被重复使用」
+    时出现，而修复前的测试每次都换新 thread，因此 205 项全绿也掩盖了它。
+    """
+
+    def test_repeat_runs_of_same_case_stand_alone(self, tmp_path: Path) -> None:
+        """同病例同输入连跑两次：两次各 4 帧，第二次不得累积第一次的记录。"""
+        db = tmp_path / "checkpoints.sqlite"
+        case = make_case(case_id="GRAPH-RERUN")
+
+        with sqlite_checkpointer(db) as saver:
+            first = run_preop(case, checkpointer=saver)
+            second = run_preop(case, checkpointer=saver)
+
+        assert first["thread_id"] != second["thread_id"]
+        assert len(first["audit_trail"]) == 4
+        assert len(second["audit_trail"]) == 4, "第二次运行不得继承上一次的审计帧"
+
+    def test_revised_case_rerun_keeps_each_chain_closed(self, tmp_path: Path) -> None:
+        """病例被修订后重跑（输入变化）—— 两次运行各自的审计链必须自闭合。
+
+        修复前这是最坏情形：第二次返回 8 帧且断链出现得更早，因为第二次运行的首环
+        输入哈希与前一次运行的某环输出对不上。
+        """
+        db = tmp_path / "checkpoints.sqlite"
+        original = make_case(case_id="GRAPH-REVISED")
+        revised = make_case(case_id="GRAPH-REVISED", neck_length_mm=12.0)
+
+        with sqlite_checkpointer(db) as saver:
+            first = run_preop(original, checkpointer=saver)
+            second = run_preop(revised, checkpointer=saver)
+
+        for result in (first, second):
+            assert len(result["audit_trail"]) == 4
+            for previous, following in pairwise(result["audit_trail"]):
+                assert previous.output_hash == following.input_hash
+
+        # 前提校验：两次输入确实不同，否则本用例证明不了「输入变化」这条路径。
+        assert first["input_snapshot_hash"] != second["input_snapshot_hash"]
+
+    def test_runs_of_one_case_are_retrievable_by_prefix(self, tmp_path: Path) -> None:
+        """「一运行一线程」不牺牲可检索性：按 ``preop:{case_id}:`` 前缀取回全部运行史。"""
+        db = tmp_path / "checkpoints.sqlite"
+        case = make_case(case_id="GRAPH-PREFIX")
+
+        with sqlite_checkpointer(db) as saver:
+            for _ in range(3):
+                run_preop(case, checkpointer=saver)
+
+        conn = sqlite3.connect(str(db))
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE ?",
+                ("preop:GRAPH-PREFIX:%",),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 3, rows
+
+    def test_explicit_thread_id_still_resumes(self, tmp_path: Path) -> None:
+        """显式传入同一 thread_id = 主动续跑 —— 此时累积是**预期行为**，不是缺陷。"""
+        db = tmp_path / "checkpoints.sqlite"
+        case = make_case(case_id="GRAPH-RESUME")
+
+        with sqlite_checkpointer(db) as saver:
+            first = run_preop(case, checkpointer=saver, thread_id="T-RESUME")
+            second = run_preop(case, checkpointer=saver, thread_id="T-RESUME")
+
+        assert first["thread_id"] == second["thread_id"] == "T-RESUME"
+        assert len(first["audit_trail"]) == 4
+        assert len(second["audit_trail"]) == 8, "显式续跑时累积是刻意保留的能力"
+
+    def test_run_ids_are_unique_within_process(self) -> None:
+        """派生标识不得碰撞 —— 碰撞会让两次运行被静默合并成一条线程。"""
+        run_ids = [graph_module._new_run_id() for _ in range(200)]
+        assert len(set(run_ids)) == len(run_ids)
+
+    def test_thread_id_stays_out_of_checkpoint(self, tmp_path: Path) -> None:
+        """运行期元信息不得进 checkpoint —— 库里只应有「关于病例的真相」。"""
+        db = tmp_path / "checkpoints.sqlite"
+        with sqlite_checkpointer(db) as saver:
+            result = run_preop(make_case(), checkpointer=saver)
+
+        with sqlite_checkpointer(db) as reopened:
+            app = build_preop_graph(checkpointer=reopened)
+            values = app.get_state(thread_config(result["thread_id"])).values
+
+        assert "thread_id" not in values
+        assert "audit_persisted" not in values
+
+    def test_thread_id_is_not_hashed(self) -> None:
+        assert "thread_id" not in HASHED_KEYS
+
+
+# ===========================================================================
 # 序列化白名单守卫
 # ===========================================================================
 class TestSerializationAllowlist:
@@ -646,7 +864,7 @@ class TestSerializationAllowlist:
 
     def test_allowlist_covers_every_type_in_state(self) -> None:
         """真实 state 里出现的每个自定义类型，都必须在白名单内。"""
-        state = run_preop(make_rich_case())
+        state = run_preop(make_rich_case(), checkpointer=None)
 
         seen: set[type] = set()
         _collect_custom_types(state, seen)
