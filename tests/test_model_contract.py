@@ -501,7 +501,7 @@ class TestRoutingRegression:
 
     def test_ruleset_version_bumped_for_o21_fix(self) -> None:
         # 版本纪律守门：每次 bump TABLE1_VERSION / TABLE2_VERSION 须同步更新本断言。
-        assert RULESET_VERSION == "table1@v1.0+table2@v1.6"
+        assert RULESET_VERSION == "table1@v1.0+table2@v1.7"
         assert route(make_case()).ruleset_version == RULESET_VERSION
 
     def test_derive_still_backfills_with_new_enums(self) -> None:
