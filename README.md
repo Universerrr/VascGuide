@@ -40,7 +40,7 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 | **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 置信度）、`UrgencyFlagAudit` |
 | **确定性规则层** | `router.py`（P0a~P8 路由流水线）+ `version.py`（规则版本注册表），详见「四」 |
 | **编排层（LangGraph）** | 四层节点 `input → router → execution → output` 串成 `StateGraph` 并接 SQLite Checkpoint；每节点自动留痕（节点名 / 起止时间 / 输入输出哈希），审计链可**逐环校验**，详见「五」 |
-| **测试与工具链** | 158 项测试全绿（41 路由基线 + 67 数据契约 + 50 编排层）、`ruff` 无告警、覆盖率 97% |
+| **测试与工具链** | 225 项测试全绿（41 路由基线 + 67 数据契约 + 64 编排层 + 39 规则分支 + 14 note 契约）、`ruff` 无告警、覆盖率 99% |
 
 ### ⏳ 尚未开始
 
@@ -272,7 +272,37 @@ audit_trail[i].output_hash == audit_trail[i+1].input_hash
 哈希**排除** `audit_trail` 本身（它含时间戳），因此「同输入 + 同规则版本 → 同哈希」，
 重复执行结果可复现（`test_hashes_are_reproducible_across_runs`）。
 
-### 4. 三条被机器守住的架构红线
+### 4. 落盘策略与运行身份
+
+「全程可审计」是红线，因此 `run_preop()` 的核心策略是**默认即安全**：
+
+| 调用方式 | 行为 |
+|---|---|
+| `run_preop(case)` | **落盘**到 `.workbuddy/state/preop_checkpoints.sqlite`（该目录已被 `.gitignore` 忽略） |
+| `run_preop(case, checkpointer=None)` | **不落盘**，并 `logging.warning` **出声** —— 仅限测试 / what-if 试算 / 压测 |
+| `run_preop(case, thread_id="T")` | 以传入值为准（调用方**主动要求 resume / 回放**） |
+
+改造前 `checkpointer` 默认 `None`，即「不传就不落盘」，而且**毫无提示** —— 属静默
+fail-open，与红线直接冲突。现在改成 fail-loud：想放弃落盘，必须显式写出来并留下告警。
+
+**运行身份与审计身份分开。** 不传 `thread_id` 时派生
+`preop:{case_id}:{run_id}`（`run_id` = UTC 微秒时间戳 + 进程内序号）：
+
+- **为什么不能只派生 `preop:{case_id}`**：`thread_id` 在 LangGraph 里是**状态机线程**，
+  对同一 thread 再 `invoke` 是 **resume（续跑）**，不是「新开一次运行」。于是带
+  `operator.add` reducer 的 `audit_trail` 会把上一次的记录一并带回（4 帧 → 8 帧），
+  审计链不变量随之断裂；病例被修订后重跑，断链出现得更早。
+- **为什么要带序号**：分区键一旦碰撞，两次运行会被**静默合并**成一条线程 —— 正是要
+  消除的那类缺陷。时间戳保证**可排序**，序号保证**同进程内不重复**。
+- **可检索性不受影响**：按前缀 `preop:{case_id}:` 即可取回该病例的**全部运行史**
+  （由 `test_runs_of_one_case_are_retrievable_by_prefix` 守住）。
+
+本次实际使用的 `thread_id` 与 `audit_persisted` 一起由返回值
+（`PreopRunResult`）回传 —— 派生值含时间戳、调用方算不出来，若不回传，自动派生的
+线程就成了「写进去但捞不出来」的死记录。这两个键都属**运行期元信息**：不进
+`PreopState`、不进哈希、不进 checkpoint（各有测试守住）。
+
+### 5. 三条被机器守住的架构红线
 
 规则不靠自觉，靠测试。以下三条由 `tests/test_preop_graph.py` 机械执行：
 
@@ -280,11 +310,11 @@ audit_trail[i].output_hash == audit_trail[i+1].input_hash
 |---|---|
 | **薄封装不藏规则** | AST 扫描 `router_layer/node.py`：代码里不得出现任何**数值常量**（阈值）、病种 / 解剖 / 处置**关键词**、以及**规则编号** |
 | **判定层零 LLM** | AST 扫描 `src/rules/` 与 `router_layer/` `execution_layer/` `output_layer/` 的全部 `import`，出现任何 LLM 客户端 SDK 即失败 |
-| **序列化白名单完整** | 从真实 state 反推全部自定义类型，与 `build_checkpoint_serde()` 的白名单比对；漏注册即失败（详见本节目第 5 小节） |
+| **序列化白名单完整** | 从真实 state 反推全部自定义类型，与 `build_checkpoint_serde()` 的白名单比对；漏注册即失败（详见本节第 6 小节） |
 
 `input_layer/` 是唯一豁免的层（它是被允许的 LLM 入口），且其抽取函数当前主动抛错。
 
-### 5. 一个必须显式处理的序列化坑
+### 6. 一个必须显式处理的序列化坑
 
 LangGraph 用 msgpack 序列化状态。对本项目自定义类型（pydantic 模型、dataclass、枚举），
 它当前的行为是「**放行但告警**」，并提示：
@@ -313,7 +343,7 @@ LangGraph 用 msgpack 序列化状态。对本项目自定义类型（pydantic �
 > 既不报错也不提示，风险反而更隐蔽。所以真正的防线只有「白名单完整 + 测试比对」，
 > 不要指望这个环境变量替你发现问题。
 
-### 6. 编排层当前的三处留白
+### 7. 编排层当前的三处留白
 
 | 留白 | 位置 | 当前状态 |
 |---|---|---|
@@ -381,18 +411,19 @@ case = VascCase(
     anatomy_level="肾下",
 )
 
-# 默认落在 .workbuddy/state/preop_checkpoints.sqlite（该目录已被 .gitignore 忽略）
-with sqlite_checkpointer() as saver:
-    state = run_preop(case, checkpointer=saver, thread_id="DEMO-001")
+# 不传 checkpointer → 默认落盘到 .workbuddy/state/preop_checkpoints.sqlite
+state = run_preop(case)
 
 print(state["final_recommendation"].route_mode)  # 指南模式
 print(len(state["final_recommendation"].decision_path))  # 10（含被否决项）
 print([record.node for record in state["audit_trail"]])  # 四个节点
+print(state["thread_id"])  # 本次落在哪条线程（派生值，须回传）
+print(state["audit_persisted"])  # True
 
 # 换一个**独立连接**读回同一份 state —— 这就是「全程可审计」的兑现
 with sqlite_checkpointer() as reopened:
     app = build_preop_graph(checkpointer=reopened)
-    print(app.get_state(thread_config("DEMO-001")).values["case"].case_id)  # DEMO-001
+    print(app.get_state(thread_config(state["thread_id"])).values["case"].case_id)  # DEMO-001
 ```
 
 > 脚本须**从仓库根**运行（`uv run python xxx.py` 或 `python -m`），否则 `import src` 会失败。
@@ -400,7 +431,7 @@ with sqlite_checkpointer() as reopened:
 ### 常用命令（测试 / 检查）
 
 ```bash
-# 跑全部测试（应为 158 passed）
+# 跑全部测试（应为 225 passed）
 uv run pytest tests/ -q
 
 # 静态检查（应为 All checks passed）
@@ -425,7 +456,7 @@ uv run pytest tests/ --cov --cov-report=term-missing
 - **覆盖了哪些代码**：`--cov-report=html` 生成 `htmlcov/index.html`，红色行即未被测试执行到的分支。
 
 > ⚠️ **覆盖率 ≠ 测试结果**：前者衡量「代码有多少行被执行到」，后者衡量「每个用例过没过」。
-> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 158 项全绿、覆盖率 97%。
+> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 225 项全绿、覆盖率 99%。
 
 ---
 
